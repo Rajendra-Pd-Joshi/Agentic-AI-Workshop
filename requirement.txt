@@ -10,4 +10,3 @@ requests
 python-docx
 pandas
 Pillow
-sqlite
