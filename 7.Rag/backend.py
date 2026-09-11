@@ -1,4 +1,5 @@
 import ast
+import json
 import io
 import math
 import os
@@ -154,7 +155,7 @@ def build_rag_index(pdf_path: str, thread_id: str) -> dict:
         "thread_id": thread_id,
     }
 
-
+import copy
 def get_rag_retriever(thread_id: str, k: int = 7):
     """
     Return an MMR retriever that searches across ALL PDFs uploaded in this thread.
@@ -170,8 +171,8 @@ def get_rag_retriever(thread_id: str, k: int = 7):
     if len(store_list) == 1:
         vs = store_list[0]
     else:
-        # Merge multiple FAISS stores into one
-        vs = store_list[0]
+        # FIX: Copy the first store so we don't mutate the cached version
+        vs = copy.deepcopy(store_list[0])
         for extra in store_list[1:]:
             vs.merge_from(extra)
 
@@ -224,22 +225,30 @@ class ChatState(TypedDict):
 # ── ORIGINAL TOOLS ──────────────────────────────────────────
 # ============================================================
 
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 @tool
-def get_current_datetime(timezone: str = "UTC") -> str:
+def get_current_datetime(tz_name: str = "UTC") -> str:
     """
     Get the current date and time for a given timezone.
     Examples of valid timezones: 'UTC', 'US/Eastern', 'Asia/Tokyo', 'Europe/London', 'Asia/Kathmandu'.
     Defaults to UTC if no timezone is provided.
     """
     try:
-        tz = ZoneInfo(timezone)
+        tz = ZoneInfo(tz_name)
         now = datetime.now(tz)
-        return now.strftime(f"%A, %B %d, %Y — %I:%M:%S %p ({timezone})")
+        human_format = now.strftime(f"%A, %B %d, %Y — %I:%M:%S %p ({tz_name})")
+        iso_format = now.isoformat()
+        return f"{human_format} | ISO: {iso_format}"
     except ZoneInfoNotFoundError:
-        now = datetime.utcnow()
+        # FIX: Replaced deprecated datetime.utcnow() with datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc) 
+        human_format = now.strftime('%A, %B %d, %Y — %I:%M:%S %p UTC')
+        iso_format = now.isoformat()
         return (
-            f"Timezone '{timezone}' not recognized. "
-            f"Falling back to UTC: {now.strftime('%A, %B %d, %Y — %I:%M:%S %p UTC')}"
+            f"Timezone '{tz_name}' not recognized. "
+            f"Falling back to UTC: {human_format} | ISO: {iso_format}"
         )
 
 
@@ -263,14 +272,23 @@ def calculate(expression: str) -> str:
         "pi": math.pi, "e": math.e, "inf": math.inf, "tau": math.tau,
     }
     try:
-        tree = ast.parse(expression.strip(), mode="eval")
+        # FIX 1: Remove 'math.' prefix so the AST attribute blocker isn't triggered
+        clean_expression = expression.strip().replace("math.", "")
+        
+        # FIX 2: Replace '^' with '**' because LLMs often use '^' for exponentiation
+        clean_expression = clean_expression.replace("^", "**")
+        
+        tree = ast.parse(clean_expression, mode="eval")
+        
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 return "Error: Import statements are not allowed."
             if isinstance(node, ast.Attribute):
                 return "Error: Attribute access is not allowed."
+                
         result = eval(compile(tree, "<expr>", "eval"), safe_globals)
         return f"{expression} = {result}"
+        
     except ZeroDivisionError:
         return "Error: Division by zero."
     except Exception as exc:
@@ -293,10 +311,17 @@ def get_weather(city: str) -> str:
         geo_data = geo_resp.json()
         if not geo_data.get("results"):
             return f"City '{city}' could not be found."
+            
         loc = geo_data["results"][0]
-        lat, lon = loc["latitude"], loc["longitude"]
-        display_name = loc["name"]
+        # FIX 1: Safely get lat/lon with .get() instead of direct key access
+        lat = loc.get("latitude")
+        lon = loc.get("longitude")
+        if lat is None or lon is None:
+            return f"Coordinates for '{city}' are missing from the geocoding service."
+            
+        display_name = loc.get("name", city)
         country = loc.get("country", "")
+        
         weather_resp = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
@@ -306,8 +331,15 @@ def get_weather(city: str) -> str:
             },
             timeout=10,
         )
-        w = weather_resp.json().get("current", {})
-        code = w.get("weather_code", -1)
+        w_data = weather_resp.json()
+        
+        # FIX 2: Safely check both 'current' and 'current_weather' schemas
+        w = w_data.get("current") or w_data.get("current_weather", {})
+        if not w:
+            return f"Weather data format unrecognized for '{city}'."
+            
+        code = w.get("weather_code", w.get("weathercode", -1))
+        
         condition_map = {
             0: "Clear sky ☀️", 1: "Mainly clear 🌤️", 2: "Partly cloudy ⛅", 3: "Overcast ☁️",
             45: "Foggy 🌫️", 48: "Icy fog 🌫️",
@@ -318,6 +350,7 @@ def get_weather(city: str) -> str:
             95: "Thunderstorm ⛈️", 96: "Thunderstorm w/ hail ⛈️", 99: "Heavy thunderstorm ⛈️",
         }
         condition = condition_map.get(code, f"Code {code}")
+        
         return (
             f"🌍 Weather in {display_name}, {country}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -344,54 +377,104 @@ def search_wikipedia(query: str, sentences: int = 4) -> str:
     """
     try:
         import wikipedia
+        import re
+        
+        # FIX 1: Set a custom user agent to prevent Wikipedia from blocking the request (403 Forbidden)
+        wikipedia.set_user_agent("AgenticAIChatbot/1.0 (admin@localhost)")
+        
         results = wikipedia.search(query, results=5)
         if not results:
             return f"No Wikipedia articles found for '{query}'."
+            
         for candidate in results:
             try:
                 page = wikipedia.page(candidate, auto_suggest=False)
-                summary = wikipedia.summary(candidate, sentences=sentences, auto_suggest=False)
-                return f"📖 **{page.title}**\n\n{summary}\n\n🔗 Source: {page.url}"
+                
+                # FIX 2: Do not call wikipedia.summary() which triggers a second network request.
+                # Instead, parse the summary directly from the already-fetched page object.
+                raw_summary = page.summary
+                
+                # Simple sentence splitter based on periods (not perfect, but fast)
+                sentence_list = [s.strip() for s in re.split(r'(?<=[.!?])\s+', raw_summary) if s.strip()]
+                short_summary = " ".join(sentence_list[:sentences])
+                
+                return f"📖 **{page.title}**\n\n{short_summary}\n\n🔗 Source: {page.url}"
+                
             except wikipedia.exceptions.DisambiguationError:
+                # If a page is ambiguous, skip to the next search result
                 continue
             except wikipedia.exceptions.PageError:
+                # If the page doesn't exist, skip to the next search result
                 continue
+                
         return f"Could not load a Wikipedia article for '{query}'."
+        
     except ImportError:
         return "The 'wikipedia' package is not installed. Run: pip install wikipedia"
     except Exception as exc:
         return f"Wikipedia error: {exc}"
 
-
 @tool
 def search_web(query: str, max_results: int = 5) -> str:
     """
-    Search the web and return top results. Tries multiple search backends
-    (DuckDuckGo text, DuckDuckGo news, Bing scrape) so it always returns
-    something useful even when one provider is rate-limited.
+    Search the web for current information.
+    Automatically uses Tavily if TAVILY_API_KEY is in the environment,
+    otherwise falls back to a rate-limit-resistant DuckDuckGo search.
     Args:
-        query: The search query (news topics, general questions, etc.).
+        query: The search query.
         max_results: Number of results to return (default 5, max 10).
     """
     max_results = min(max_results, 10)
+    
+    # --- Strategy 1: Tavily (If API Key is available) ---
+    tavily_key = os.getenv("TAVILY_API_KEY")
+    if tavily_key:
+        try:
+            from langchain_community.tools.tavily_search import TavilySearchResults
+            # or simply use the requests library to hit tavily directly to avoid new dependencies
+            # Actually using requests is safer to avoid forcing them to pip install another langchain package if they don't want to.
+            # Wait, using requests for Tavily is super easy:
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "api_key": tavily_key,
+                "query": query,
+                "search_depth": "basic",
+                "include_answer": False,
+                "max_results": max_results
+            }
+            resp = requests.post("https://api.tavily.com/search", json=payload, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = []
+                for r in data.get("results", []):
+                    results.append(f"📌 **{r.get('title')}**\n   {r.get('content')}\n   🔗 {r.get('url')}")
+                if results:
+                    return f"🔍 Web results for: *{query}* (via Tavily)\n\n" + "\n\n".join(results)
+        except Exception as e:
+            pass # Fall back to DDG if Tavily fails
 
-    # ── Strategy 1: DuckDuckGo text search ──────────────────
+    # --- Strategy 2: DuckDuckGo 'lite' Backend (No API Key needed) ---
     try:
         from duckduckgo_search import DDGS
+        import time
+        
         results = []
         with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                results.append(
-                    f"📌 **{r['title']}**\n   {r['body']}\n   🔗 {r['href']}"
-                )
+            # Using 'lite' backend bypasses the heavy JS bot-checks
+            for r in ddgs.text(query, max_results=max_results, backend="lite"):
+                results.append(f"📌 **{r['title']}**\n   {r['body']}\n   🔗 {r['href']}")
+        
         if results:
             return f"🔍 Web search results for: *{query}*\n\n" + "\n\n".join(results)
-    except Exception:
+    except Exception as e:
         pass
 
-    # ── Strategy 2: DuckDuckGo news search ──────────────────
+    # --- Strategy 3: DuckDuckGo News (If text is rate-limited) ---
     try:
         from duckduckgo_search import DDGS
+        import time
+        time.sleep(1) # Small delay to prevent immediate secondary rate limit
+        
         results = []
         with DDGS() as ddgs:
             for r in ddgs.news(query, max_results=max_results):
@@ -403,45 +486,18 @@ def search_web(query: str, max_results: int = 5) -> str:
                 )
         if results:
             return f"🔍 News search results for: *{query}*\n\n" + "\n\n".join(results)
-    except Exception:
-        pass
-
-    # ── Strategy 3: Bing scrape fallback ────────────────────
-    try:
-        from bs4 import BeautifulSoup
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-        }
-        resp = requests.get(
-            "https://www.bing.com/search",
-            params={"q": query, "count": max_results},
-            headers=headers, timeout=10
-        )
-        soup = BeautifulSoup(resp.text, "html.parser")
-        results = []
-        for item in soup.select("li.b_algo")[:max_results]:
-            title_el = item.select_one("h2 a")
-            snippet_el = item.select_one(".b_caption p")
-            if title_el:
-                title = title_el.get_text(strip=True)
-                link = title_el.get("href", "")
-                snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-                results.append(f"📌 **{title}**\n   {snippet}\n   🔗 {link}")
-        if results:
-            return f"🔍 Web results for: *{query}*\n\n" + "\n\n".join(results)
-    except Exception:
+    except Exception as e:
         pass
 
     return (
-        f"⚠️ All search providers are temporarily unavailable for '{query}'.\n"
-        f"This is usually a rate-limit issue. Try again in a few seconds, "
-        f"or use fetch_webpage with a direct URL."
+        f"⚠️ All search providers failed for '{query}'.\n"
+        f"If you are getting rate-limited constantly, consider getting a free API key "
+        f"from tavily.com and adding TAVILY_API_KEY to your .env file."
     )
 
+import email.utils
+import re
+import requests
 
 @tool
 def get_news(topic: str = "", country: str = "", max_results: int = 8) -> str:
@@ -461,63 +517,55 @@ def get_news(topic: str = "", country: str = "", max_results: int = 8) -> str:
     except ImportError:
         return "The 'feedparser' package is not installed. Run: pip install feedparser"
 
-    max_results = min(max_results, 20)
-
-    # Build list of feeds to try based on inputs
+    max_results = max(1, min(max_results, 20))
     combined = f"{topic} {country}".lower().strip()
 
-    # Country/region-specific RSS feeds
+    # Regional Feeds
     COUNTRY_FEEDS = {
         "nepal": [
-            ("The Himalayan Times",  "https://thehimalayantimes.com/feed/"),
-            ("Kathmandu Post",       "https://kathmandupost.com/rss"),
+            ("The Himalayan Times", "https://thehimalayantimes.com/feed"),
+            ("Kathmandu Post", "https://kathmandupost.com/rss"),
             ("OnlineKhabar English", "https://english.onlinekhabar.com/feed"),
-            ("My Republica",         "https://myrepublica.nagariknetwork.com/rss/"),
-            ("Rising Nepal Daily",   "https://risingnepaldaily.com/feed"),
-            ("Nepal News",           "https://nepalnews.com/feed"),
-            ("Setopati English",     "https://setopati.com/feed"),
+            ("Setopati English", "https://setopati.com/feed"),
         ],
         "india": [
-            ("Times of India",   "https://timesofindia.indiatimes.com/rssfeedstopstories.cms"),
-            ("NDTV",             "https://feeds.feedburner.com/ndtvnews-top-stories"),
-            ("The Hindu",        "https://www.thehindu.com/feeder/default.rss"),
+            ("Times of India", "https://timesofindia.indiatimes.com/rssfeedstopstories.cms"),
+            ("The Hindu", "https://www.thehindu.com/feeder/default.rss"),
+            ("NDTV", "https://feeds.feedburner.com/ndtvnews-top-stories"),
         ],
         "us": [
-            ("NPR",     "https://feeds.npr.org/1001/rss.xml"),
-            ("CNN",     "http://rss.cnn.com/rss/edition.rss"),
-            ("Reuters", "https://feeds.reuters.com/reuters/topNews"),
+            ("NPR", "https://feeds.npr.org/1001/rss.xml"),
+            ("CNN Top Stories", "http://rss.cnn.com/rss/edition.rss"),
         ],
         "uk": [
-            ("BBC",         "https://feeds.bbci.co.uk/news/rss.xml"),
-            ("The Guardian", "https://www.theguardian.com/uk/rss"),
-            ("Sky News",     "https://feeds.skynews.com/feeds/rss/world.xml"),
+            ("BBC News", "https://feeds.bbci.co.uk/news/rss.xml"),
+            ("The Guardian World", "https://www.theguardian.com/world/rss"),
         ],
     }
 
-    # General/international feeds
+    # Universal / Search-driven feeds
+    query_param = topic or country or "world news"
     GENERAL_FEEDS = [
-        ("BBC World",       "https://feeds.bbci.co.uk/news/world/rss.xml"),
-        ("Reuters",         "https://feeds.reuters.com/reuters/topNews"),
-        ("Al Jazeera",      "https://www.aljazeera.com/xml/rss/all.xml"),
-        ("AP News",         "https://rsshub.app/apnews/topics/apf-topnews"),
-        ("Google News",     f"https://news.google.com/rss/search?q={topic or 'world+news'}&hl=en&gl=US&ceid=US:en"),
-        ("NPR",             "https://feeds.npr.org/1001/rss.xml"),
+        ("Google News", f"https://news.google.com/rss/search?q={requests.utils.quote(query_param)}&hl=en&gl=US&ceid=US:en"),
+        ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+        ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
     ]
 
-    # Select which feeds to query
+    # Select target feeds
     feeds_to_try = []
     for key, feed_list in COUNTRY_FEEDS.items():
         if key in combined:
-            feeds_to_try = feed_list + GENERAL_FEEDS[:2]
+            feeds_to_try = feed_list + GENERAL_FEEDS
             break
     if not feeds_to_try:
         feeds_to_try = GENERAL_FEEDS
 
+    # Realistic browser headers to prevent 403 Forbidden errors
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
+            "Chrome/124.0.0.0 Safari/537.36"
         ),
         "Accept": "application/rss+xml, application/xml, text/xml, */*",
     }
@@ -526,33 +574,39 @@ def get_news(topic: str = "", country: str = "", max_results: int = 8) -> str:
     sources_used = []
 
     for feed_name, feed_url in feeds_to_try:
+        # Stop fetching once we have gathered more than enough candidates
+        if len(all_entries) >= max_results * 2:
+            break
+
         try:
-            resp = requests.get(feed_url, headers=headers, timeout=8)
+            # Low timeout (4s) so stalled feeds do not hang the whole tool
+            resp = requests.get(feed_url, headers=headers, timeout=4)
             if resp.status_code != 200:
                 continue
+
             feed = feedparser.parse(resp.content)
             if not feed.entries:
                 continue
+
             sources_used.append(feed_name)
             for entry in feed.entries:
                 title = entry.get("title", "").strip()
-                link  = entry.get("link", "")
+                link = entry.get("link", "")
                 summary = entry.get("summary", entry.get("description", "")).strip()
-                # Strip HTML tags from summary
                 summary = re.sub(r"<[^>]+>", "", summary)[:200]
-                # Parse published date
+
                 pub = entry.get("published", entry.get("updated", ""))
                 try:
-                    import email.utils
                     pub_dt = email.utils.parsedate_to_datetime(pub)
                     pub_str = pub_dt.strftime("%b %d, %Y %H:%M")
                 except Exception:
                     pub_str = pub[:16] if pub else ""
-                # Filter by topic keyword if given
-                if topic:
+
+                if topic and feed_name != "Google News":
                     haystack = (title + " " + summary).lower()
                     if not any(kw in haystack for kw in topic.lower().split()):
                         continue
+
                 all_entries.append({
                     "title": title,
                     "link": link,
@@ -563,111 +617,181 @@ def get_news(topic: str = "", country: str = "", max_results: int = 8) -> str:
         except Exception:
             continue
 
+    # Fallback to DuckDuckGo news if RSS feeds were blocked or returned nothing
     if not all_entries:
-        # Last resort: try DuckDuckGo news
         try:
             from duckduckgo_search import DDGS
             search_q = f"{topic} {country} news".strip()
-            results = []
             with DDGS() as ddgs:
                 for r in ddgs.news(search_q, max_results=max_results):
                     date = r.get("date", "")[:10]
-                    results.append(
-                        f"📰 **{r['title']}** ({date})\n"
-                        f"   {r.get('body', '')[:200]}\n"
-                        f"   Source: {r.get('source', '?')} · 🔗 {r['url']}"
-                    )
-            if results:
-                label = f"{topic} {country}".strip() or "World"
-                return f"📰 Latest news — *{label}*\n\n" + "\n\n".join(results[:max_results])
+                    all_entries.append({
+                        "title": r.get("title", ""),
+                        "link": r.get("url", ""),
+                        "summary": r.get("body", "")[:200],
+                        "pub": date,
+                        "source": r.get("source", "DuckDuckGo News"),
+                    })
+            if all_entries:
+                sources_used.append("DuckDuckGo News")
         except Exception:
             pass
+
+    if not all_entries:
         return (
             f"⚠️ Could not fetch news for '{topic or country or 'world'}' right now.\n"
-            f"All RSS sources returned 403 (blocked by server) and DuckDuckGo is rate-limited.\n"
-            f"Try using fetch_webpage with a direct URL like https://kathmandupost.com or https://thehimalayantimes.com"
+            f"Providers timed out or rate-limited. Try using `fetch_webpage` with a direct URL."
         )
 
-    # Deduplicate by title
+    # Deduplicate entries by title
     seen = set()
     unique_entries = []
     for e in all_entries:
-        key = e["title"].lower()[:60]
-        if key not in seen:
-            seen.add(key)
+        clean_title = re.sub(r"[^\w\s]", "", e["title"]).lower()[:50]
+        if clean_title not in seen:
+            seen.add(clean_title)
             unique_entries.append(e)
 
-    # Take top N
     top = unique_entries[:max_results]
     lines = []
     for e in top:
         pub_str = f" · {e['pub']}" if e["pub"] else ""
         summary_str = f"\n   {e['summary']}" if e["summary"] else ""
-        lines.append(
-            f"📰 **{e['title']}**{summary_str}\n"
-            f"   {e['source']}{pub_str} · 🔗 {e['link']}"
-        )
+        lines.append(f"📰 **{e['title']}**{summary_str}\n   {e['source']}{pub_str} · 🔗 {e['link']}")
 
     label = " | ".join(dict.fromkeys(sources_used))
     header_topic = f"{topic} {country}".strip() or "World"
     return (
         f"📰 **Latest News — {header_topic}** ({len(top)} headlines)\n"
         f"Sources: {label}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        + "\n\n".join(lines)
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n".join(lines)
     )
 
+import requests
 
 @tool
 def fetch_webpage(url: str) -> str:
     """
-    Fetch and extract the readable text content from any public webpage URL.
-    Useful for reading articles, documentation, or any page the user shares.
+    Fetch and extract readable text content from any public webpage URL.
+    Useful for reading articles, documentation, or links shared by the user.
     Args:
         url: The full URL including https:// or http://
     """
     try:
         from bs4 import BeautifulSoup
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        response = requests.get(url, headers=headers, timeout=15)
+
+        # Modern browser request headers to avoid 403 Forbidden / bot blocks
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.google.com/",
+        }
+
+        response = requests.get(url, headers=headers, timeout=12)
         response.raise_for_status()
+
+        # Fix encoding issues (prevents garbled apostrophes/quotes)
+        if response.encoding is None or response.encoding == "ISO-8859-1":
+            response.encoding = response.apparent_encoding
+
         soup = BeautifulSoup(response.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
+
+        # Strip non-content and clutter elements
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "svg", "noscript"]):
             tag.decompose()
+
+        # Prioritize core content containers
         main = (
-            soup.find("article") or soup.find("main")
-            or soup.find(id="content") or soup.find(class_="content") or soup.body
+            soup.find("article")
+            or soup.find("main")
+            or soup.find(id="content")
+            or soup.find(id="main-content")
+            or soup.find(class_="content")
+            or soup.find(class_="post-content")
+            or soup.find(class_="article-body")
+            or soup.body
         )
+
         text = (main or soup).get_text(separator="\n", strip=True)
-        lines = [ln for ln in text.splitlines() if ln.strip()]
-        text = "\n".join(lines)
-        if len(text) > 4000:
-            text = text[:4000] + "\n\n… [Content truncated to 4000 characters]"
-        return f"📄 Content from {url}:\n\n{text}"
+
+        # Remove excessive whitespace while preserving readable paragraphs
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        cleaned_text = "\n".join(lines)
+
+        if not cleaned_text:
+            return f"⚠️ Could not extract readable text from {url}. The site may require JavaScript rendering."
+
+        if len(cleaned_text) > 4000:
+            cleaned_text = cleaned_text[:4000] + "\n\n… [Content truncated to 4000 characters]"
+
+        return f"📄 Content from {url}:\n\n{cleaned_text}"
+
     except requests.HTTPError as exc:
-        return f"HTTP error fetching page: {exc}"
+        return f"HTTP error fetching page ({exc.response.status_code}): {exc}"
     except requests.Timeout:
-        return "Request timed out. The page may be slow or unavailable."
+        return "Request timed out. The website server may be slow or blocking automated traffic."
     except ImportError:
         return "The 'beautifulsoup4' package is not installed. Run: pip install beautifulsoup4"
     except Exception as exc:
         return f"Webpage fetch error: {exc}"
 
 
+import re
+
 @tool
 def convert_units(value: float, from_unit: str, to_unit: str) -> str:
     """
     Convert a numeric value between common units of measurement.
     Supported categories:
-      - Length:      km, miles, meters, feet, inches, cm, mm, yards
+      - Length: km, miles, meters, feet, inches, cm, mm, yards
       - Weight/Mass: kg, lbs, grams, oz, mg, tonnes
-      - Volume:      liters, ml, gallons, cups, pints, quarts, fl_oz
+      - Volume: liters, ml, gallons, cups, pints, quarts, fl_oz
       - Temperature: celsius, fahrenheit, kelvin
-      - Speed:       kmh, mph, ms (meters per second), knots
-      - Area:        sqm, sqft, sqkm, sqmiles, acres, hectares
+      - Speed: kmh, mph, ms (meters per second), knots
+      - Area: sqm, sqft, sqkm, sqmiles, acres, hectares
+      - Time: seconds, minutes, hours, days, weeks, years
+      - Data: bytes, kb, mb, gb, tb
     """
-    f = from_unit.lower().strip()
-    t = to_unit.lower().strip()
+    
+    # 1. Standardize formatting and strip punctuation (e.g. "lbs." -> "lbs", "sq ft" -> "sqft")
+    f = re.sub(r'[^a-z0-9]', '', str(from_unit).lower().strip())
+    t = re.sub(r'[^a-z0-9]', '', str(to_unit).lower().strip())
+
+    # 2. Map aliases to standard internal keys
+    aliases = {
+        # Temperature
+        "c": "celsius", "f": "fahrenheit", "k": "kelvin",
+        # Length
+        "m": "meters", "meter": "meters", "km": "kilometers", "kms": "kilometers", 
+        "mile": "miles", "ft": "feet", "foot": "feet", "in": "inches", "inch": "inches",
+        "cm": "centimeters", "mm": "millimeters", "yd": "yards", "yard": "yards",
+        # Weight
+        "g": "grams", "gram": "grams", "kg": "kilograms", "kgs": "kilograms",
+        "lb": "pounds", "lbs": "pounds", "oz": "ounces", "ounce": "ounces", "mg": "milligrams",
+        # Volume
+        "l": "liters", "liter": "liters", "ml": "milliliters", "gal": "gallons", "gallon": "gallons",
+        "floz": "floz", "cup": "cups", "pint": "pints", "quart": "quarts",
+        # Speed
+        "ms": "ms", "meterspersecond": "ms", "kmh": "kmh", "mph": "mph", "knot": "knots",
+        # Area
+        "m2": "sqm", "sqmeter": "sqm", "sqft": "sqft", "sqfoot": "sqft", "sqkm": "sqkm", 
+        "sqmile": "sqmiles", "sqmiles": "sqmiles", "acre": "acres", "ha": "hectares",
+        # Time
+        "s": "seconds", "sec": "seconds", "secs": "seconds", "min": "minutes", "mins": "minutes",
+        "hr": "hours", "hrs": "hours", "hour": "hours", "day": "days", "wk": "weeks", "yr": "years",
+        # Data
+        "b": "bytes", "byte": "bytes"
+    }
+
+    f_std = aliases.get(f, f)
+    t_std = aliases.get(t, t)
+
+    # 3. Temperature Conversions (Special formulas)
     temp_conversions = {
         ("celsius", "fahrenheit"): lambda v: v * 9 / 5 + 32,
         ("fahrenheit", "celsius"): lambda v: (v - 32) * 5 / 9,
@@ -676,56 +800,89 @@ def convert_units(value: float, from_unit: str, to_unit: str) -> str:
         ("fahrenheit", "kelvin"):  lambda v: (v - 32) * 5 / 9 + 273.15,
         ("kelvin", "fahrenheit"):  lambda v: (v - 273.15) * 9 / 5 + 32,
     }
-    if (f, t) in temp_conversions:
-        result = temp_conversions[(f, t)](value)
+    
+    if (f_std, t_std) in temp_conversions:
+        result = temp_conversions[(f_std, t_std)](value)
         unit_symbols = {"celsius": "°C", "fahrenheit": "°F", "kelvin": "K"}
-        fs, ts = unit_symbols.get(f, f), unit_symbols.get(t, t)
-        return f"{value}{fs} = {round(result, 6)}{ts}"
-    if f == t:
-        return f"{value} {f} = {value} {t}"
-    length = {"meters": 1, "m": 1, "km": 1000, "kilometers": 1000, "miles": 1609.344, "mile": 1609.344, "feet": 0.3048, "ft": 0.3048, "inches": 0.0254, "inch": 0.0254, "in": 0.0254, "cm": 0.01, "centimeters": 0.01, "mm": 0.001, "millimeters": 0.001, "yards": 0.9144, "yd": 0.9144, "nautical_miles": 1852}
-    weight = {"grams": 1, "g": 1, "kg": 1000, "kilograms": 1000, "lbs": 453.592, "pounds": 453.592, "lb": 453.592, "oz": 28.3495, "ounces": 28.3495, "mg": 0.001, "milligrams": 0.001, "tonnes": 1_000_000}
-    volume = {"ml": 1, "milliliters": 1, "liters": 1000, "l": 1000, "gallons": 3785.41, "gal": 3785.41, "cups": 236.588, "pints": 473.176, "quarts": 946.353, "fl_oz": 29.5735, "tbsp": 14.7868, "tsp": 4.92892}
-    speed  = {"ms": 1, "m/s": 1, "kmh": 0.277778, "km/h": 0.277778, "mph": 0.44704, "knots": 0.514444, "fps": 0.3048}
-    area   = {"sqm": 1, "m2": 1, "sqft": 0.092903, "sqkm": 1_000_000, "sqmiles": 2_589_988.11, "acres": 4046.86, "hectares": 10_000, "ha": 10_000}
-    for _, table in [("Length", length), ("Weight", weight), ("Volume", volume), ("Speed", speed), ("Area", area)]:
-        if f in table and t in table:
-            result = value * table[f] / table[t]
-            return f"{value} {from_unit} = {round(result, 6)} {to_unit}"
-    return f"Conversion from '{from_unit}' to '{to_unit}' is not supported.\nSupported: Length, Weight, Volume, Temperature, Speed, Area."
+        fs, ts = unit_symbols.get(f_std, f_std), unit_symbols.get(t_std, t_std)
+        # Using %g removes trailing zeros for a clean output (e.g. 10.0 becomes 10)
+        return f"{value:g}{fs} = {result:g}{ts}"
 
+    if f_std == t_std:
+        return f"{value:g} {from_unit} = {value:g} {to_unit}"
+
+    # 4. Multiplier Tables (Base unit to target conversion)
+    length = {"meters": 1, "kilometers": 1000, "miles": 1609.344, "feet": 0.3048, "inches": 0.0254, "centimeters": 0.01, "millimeters": 0.001, "yards": 0.9144, "nauticalmiles": 1852}
+    weight = {"grams": 1, "kilograms": 1000, "pounds": 453.59237, "ounces": 28.3495, "milligrams": 0.001, "tonnes": 1000000}
+    volume = {"milliliters": 1, "liters": 1000, "gallons": 3785.41, "cups": 236.588, "pints": 473.176, "quarts": 946.353, "floz": 29.5735, "tbsp": 14.7868, "tsp": 4.92892}
+    speed  = {"ms": 1, "kmh": 0.277778, "mph": 0.44704, "knots": 0.514444, "fps": 0.3048}
+    area   = {"sqm": 1, "sqft": 0.092903, "sqkm": 1000000, "sqmiles": 2589988.11, "acres": 4046.86, "hectares": 10000}
+    time_t = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400, "weeks": 604800, "years": 31536000}
+    data   = {"bytes": 1, "kb": 1024, "mb": 1024**2, "gb": 1024**3, "tb": 1024**4}
+
+    # 5. Execute Conversion
+    for category_name, table in [("Length", length), ("Weight", weight), ("Volume", volume), ("Speed", speed), ("Area", area), ("Time", time_t), ("Data", data)]:
+        if f_std in table and t_std in table:
+            # Formula: (Value * Source_Base_Multiplier) / Target_Base_Multiplier
+            result = value * table[f_std] / table[t_std]
+            return f"{value:g} {from_unit} = {result:g} {to_unit}"
+
+    return (
+        f"Conversion from '{from_unit}' to '{to_unit}' is not supported or crosses categories.\n"
+        f"Supported Categories: Length, Weight, Volume, Temperature, Speed, Area, Time, Data."
+    )
+
+import re
+from collections import Counter
 
 @tool
 def analyze_text(text: str) -> str:
     """
     Analyze a block of text and return detailed statistics.
     Returns: character count, word count, unique words, sentence count,
-             paragraph count, average word length, most common words.
+             paragraph count, average word length, most common words, and estimated reading time.
     """
+    if not text or not text.strip():
+        return "⚠️ Error: The provided text is empty."
+
+    # 1. Better word extraction
     words_raw = text.split()
-    words_clean = [re.sub(r"[^\w']", "", w).lower() for w in words_raw if re.sub(r"[^\w']", "", w)]
-    sentences = [s.strip() for s in re.split(r"[.!?]+", text) if s.strip()]
+    words_clean = [re.sub(r"[^\w']", "", w).lower() for w in words_raw]
+    words_clean = [w for w in words_clean if w]
+    
+    # 2. Better sentence splitting (handles decimals and ellipses better)
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    
     unique_words = set(words_clean)
     avg_word_len = round(sum(len(w) for w in words_clean) / len(words_clean), 2) if words_clean else 0
+    
+    # 3. Estimated Reading Time (Average adult reads ~238 WPM)
+    reading_time_minutes = max(1, round(len(words_raw) / 238))
+    
+    # 4. Stopwords filtering
     stopwords = {"the","a","an","and","or","but","in","on","at","to","for","of","with","is","was","are","were","it","its","this","that","i","you","he","she","we","they","be","been","have","has","had","do","does","did","will","would","could","should","may","might","not","from","by","as","so","if","my","your","our","their","his","her"}
     content_words = [w for w in words_clean if w not in stopwords and len(w) > 2]
+    
     top_words = Counter(content_words).most_common(5)
     top_str = ", ".join(f"'{w}' ({c}x)" for w, c in top_words) if top_words else "N/A"
-    return (
-        f"📊 Text Analysis\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"• Total characters:       {len(text)}\n"
-        f"• Characters (no spaces): {len(text.replace(' ', ''))}\n"
-        f"• Total words:            {len(words_raw)}\n"
-        f"• Unique words:           {len(unique_words)}\n"
-        f"• Sentences:              {len(sentences)}\n"
-        f"• Paragraphs:             {len(paragraphs)}\n"
-        f"• Avg word length:        {avg_word_len} chars\n"
-        f"• Avg words/sentence:     {round(len(words_raw) / max(len(sentences), 1), 1)}\n"
-        f"• Top content words:      {top_str}"
-    )
+    
+    chars_no_spaces = len(re.sub(r'\s+', '', text))
 
+    return (
+        f"📊 **Text Analysis**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• Total characters:        {len(text)}\n"
+        f"• Characters (no spaces):  {chars_no_spaces}\n"
+        f"• Total words:             {len(words_raw)}\n"
+        f"• Unique words:            {len(unique_words)}\n"
+        f"• Sentences:               {len(sentences)}\n"
+        f"• Paragraphs:              {len(paragraphs)}\n"
+        f"• Avg word length:         {avg_word_len} chars\n"
+        f"• Avg words/sentence:      {round(len(words_raw) / max(len(sentences), 1), 1)}\n"
+        f"• Est. Reading Time:       ~{reading_time_minutes} min\n"
+        f"• Top content words:       {top_str}"
+    )
 
 @tool
 def generate_uuid(count: int = 1) -> str:
@@ -769,6 +926,7 @@ def random_number(minimum: float = 0, maximum: float = 100, count: int = 1, as_i
 # ============================================================
 # ── NEW: KNOWLEDGE & RESEARCH TOOLS ─────────────────────────
 # ============================================================
+import re
 
 @tool
 def search_arxiv(query: str, max_results: int = 5) -> str:
@@ -781,15 +939,35 @@ def search_arxiv(query: str, max_results: int = 5) -> str:
     """
     try:
         import arxiv
-        max_results = min(max_results, 10)
-        client = arxiv.Client()
-        search = arxiv.Search(query=query, max_results=max_results, sort_by=arxiv.SortCriterion.Relevance)
+        max_results = max(1, min(max_results, 10))
+        
+        # FIX 1: Use a custom client with retries to handle arXiv's unstable API
+        client = arxiv.Client(
+            page_size=max_results,
+            delay_seconds=3.0,
+            num_retries=3
+        )
+        
+        search = arxiv.Search(
+            query=query, 
+            max_results=max_results, 
+            sort_by=arxiv.SortCriterion.Relevance
+        )
+        
         results = []
         for paper in client.results(search):
             authors = ", ".join(a.name for a in paper.authors[:3])
             if len(paper.authors) > 3:
                 authors += " et al."
-            abstract = paper.summary[:300] + "..." if len(paper.summary) > 300 else paper.summary
+                
+            # FIX 2: Strip hard-coded newlines from the abstract so it renders cleanly
+            raw_abstract = paper.summary.replace("\n", " ")
+            abstract = re.sub(r'\s+', ' ', raw_abstract).strip()
+            
+            # Truncate slightly to save tokens in the LLM's context window
+            if len(abstract) > 400:
+                abstract = abstract[:397] + "..."
+                
             results.append(
                 f"📄 **{paper.title}**\n"
                 f"   Authors: {authors}\n"
@@ -797,14 +975,19 @@ def search_arxiv(query: str, max_results: int = 5) -> str:
                 f"   Abstract: {abstract}\n"
                 f"   🔗 {paper.entry_id}"
             )
+            
         if not results:
             return f"No arXiv papers found for '{query}'."
-        return f"📚 arXiv results for: *{query}*\n\n" + "\n\n".join(results)
+            
+        return f"📚 **arXiv results for: *{query}***\n\n" + "\n\n".join(results)
+        
     except ImportError:
         return "The 'arxiv' package is not installed. Run: pip install arxiv"
     except Exception as exc:
         return f"arXiv search error: {exc}"
 
+import os
+import requests
 
 @tool
 def search_pubmed(query: str, max_results: int = 5) -> str:
@@ -815,41 +998,83 @@ def search_pubmed(query: str, max_results: int = 5) -> str:
         max_results: Number of results to return (default 5, max 10).
     """
     try:
-        max_results = min(max_results, 10)
-        # Step 1: search for IDs
+        max_results = max(1, min(max_results, 10))
+
+        # NCBI Entrez parameters to prevent 429 rate limits & IP bans
+        email = os.getenv("NCBI_EMAIL", "agent@localhost")
+        tool_name = "AgenticAIChatbot"
+        api_key = os.getenv("NCBI_API_KEY", "")
+
+        base_params = {
+            "db": "pubmed",
+            "retmode": "json",
+            "tool": tool_name,
+            "email": email,
+        }
+        if api_key:
+            base_params["api_key"] = api_key
+
+        # Step 1: Search for PubMed IDs (PMIDs)
         search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-        search_resp = requests.get(search_url, params={
-            "db": "pubmed", "term": query, "retmax": max_results, "retmode": "json"
-        }, timeout=10)
+        search_params = {
+            **base_params,
+            "term": query,
+            "retmax": max_results,
+            "sort": "relevance",
+        }
+
+        search_resp = requests.get(search_url, params=search_params, timeout=10)
+        search_resp.raise_for_status()
         search_data = search_resp.json()
+
         ids = search_data.get("esearchresult", {}).get("idlist", [])
         if not ids:
             return f"No PubMed articles found for '{query}'."
-        # Step 2: fetch summaries
+
+        # Step 2: Fetch summaries for returned IDs
         summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-        summary_resp = requests.get(summary_url, params={
-            "db": "pubmed", "id": ",".join(ids), "retmode": "json"
-        }, timeout=10)
+        summary_params = {
+            **base_params,
+            "id": ",".join(ids),
+        }
+
+        summary_resp = requests.get(summary_url, params=summary_params, timeout=10)
+        summary_resp.raise_for_status()
         summary_data = summary_resp.json().get("result", {})
+
         results = []
         for uid in ids:
             article = summary_data.get(uid, {})
-            title = article.get("title", "Unknown title")
+            title = article.get("title", "Unknown title").strip().rstrip(".")
             authors = article.get("authors", [])
             author_names = ", ".join(a.get("name", "") for a in authors[:3])
             if len(authors) > 3:
                 author_names += " et al."
+            if not author_names:
+                author_names = "Unknown authors"
+
             pub_date = article.get("pubdate", "Unknown date")
+            source = article.get("source", "NCBI")
+
             results.append(
                 f"🔬 **{title}**\n"
                 f"   Authors: {author_names}\n"
-                f"   Published: {pub_date}\n"
+                f"   Published: {pub_date} ({source})\n"
                 f"   🔗 https://pubmed.ncbi.nlm.nih.gov/{uid}/"
             )
-        return f"🏥 PubMed results for: *{query}*\n\n" + "\n\n".join(results)
+
+        return f"🏥 **PubMed results for: *{query}***\n\n" + "\n\n".join(results)
+
+    except requests.HTTPError as exc:
+        return f"PubMed API HTTP error ({exc.response.status_code}): {exc}"
+    except requests.Timeout:
+        return "PubMed API request timed out. NCBI servers may be busy."
     except Exception as exc:
         return f"PubMed search error: {exc}"
 
+
+import html
+import requests
 
 @tool
 def stackoverflow_search(query: str, max_results: int = 5) -> str:
@@ -857,32 +1082,55 @@ def stackoverflow_search(query: str, max_results: int = 5) -> str:
     Search Stack Overflow for programming questions and answers.
     Args:
         query: Programming question or error message to search.
-        max_results: Number of results to return (default 5).
+        max_results: Number of results to return (default 5, max 10).
     """
     try:
+        max_results = max(1, min(max_results, 10))
         url = "https://api.stackexchange.com/2.3/search/advanced"
+        
+        # FIX 3: Removed 'filter="withbody"' to drastically reduce latency and payload size
         resp = requests.get(url, params={
-            "order": "desc", "sort": "relevance", "q": query,
-            "site": "stackoverflow", "pagesize": min(max_results, 10),
-            "filter": "withbody"
+            "order": "desc", 
+            "sort": "relevance", 
+            "q": query,
+            "site": "stackoverflow", 
+            "pagesize": max_results
         }, timeout=10)
+        
+        resp.raise_for_status()
         data = resp.json()
+        
+        # FIX 2: Explicitly catch Stack Exchange API rate limits and errors
+        if "error_id" in data:
+            return f"Stack Overflow API Error {data['error_id']}: {data.get('error_message')}"
+            
         items = data.get("items", [])
         if not items:
             return f"No Stack Overflow results found for '{query}'."
+            
         results = []
         for item in items:
-            title = item.get("title", "Unknown")
+            # FIX 1: Unescape HTML entities (e.g., &#39; to ')
+            raw_title = item.get("title", "Unknown")
+            title = html.unescape(raw_title)
+            
             link = item.get("link", "")
             score = item.get("score", 0)
             answered = "✅ Answered" if item.get("is_answered") else "❓ Unanswered"
             answer_count = item.get("answer_count", 0)
+            
             results.append(
                 f"💻 **{title}**\n"
                 f"   {answered} · {answer_count} answers · Score: {score}\n"
                 f"   🔗 {link}"
             )
-        return f"🔍 Stack Overflow results for: *{query}*\n\n" + "\n\n".join(results)
+            
+        return f"🔍 **Stack Overflow results for: *{query}***\n\n" + "\n\n".join(results)
+        
+    except requests.HTTPError as exc:
+        return f"Stack Overflow API HTTP error ({exc.response.status_code}): {exc}"
+    except requests.Timeout:
+        return "Stack Overflow API request timed out."
     except Exception as exc:
         return f"Stack Overflow search error: {exc}"
 
@@ -890,6 +1138,11 @@ def stackoverflow_search(query: str, max_results: int = 5) -> str:
 # ============================================================
 # ── NEW: CODE & DEVELOPER TOOLS ─────────────────────────────
 # ============================================================
+
+import os
+import sys
+import subprocess
+import tempfile
 
 @tool
 def run_python(code: str) -> str:
@@ -900,17 +1153,26 @@ def run_python(code: str) -> str:
         code: Valid Python code to execute. Use print() to show results.
     Warning: Code runs in an isolated subprocess with a 10-second timeout.
     """
+    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        # FIX 2: Explicitly set encoding to utf-8 so emojis/symbols don't crash Windows terminals
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
             f.write(code)
             tmp_path = f.name
+            
+        # FIX 1: Use sys.executable instead of "python3" so it works seamlessly on Windows (.venv)
         result = subprocess.run(
-            ["python3", tmp_path],
-            capture_output=True, text=True, timeout=10
+            [sys.executable, tmp_path],
+            capture_output=True, 
+            text=True, 
+            encoding="utf-8",
+            errors="replace",
+            timeout=10
         )
-        os.unlink(tmp_path)
+        
         output = result.stdout.strip()
         errors = result.stderr.strip()
+        
         if errors and not output:
             return f"❌ Error:\n```\n{errors}\n```"
         if errors:
@@ -918,246 +1180,1542 @@ def run_python(code: str) -> str:
         if not output:
             return "✅ Code executed successfully (no output produced)."
         return f"✅ Output:\n```\n{output}\n```"
+        
     except subprocess.TimeoutExpired:
         return "❌ Code execution timed out after 10 seconds."
     except Exception as exc:
         return f"Code execution error: {exc}"
-
+    finally:
+        # FIX 3: Guarantee temp file cleanup even if timeouts/errors happen
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 @tool
-def github_search(query: str, search_type: str = "repositories", max_results: int = 5) -> str:
+def github_search(
+    query: str,
+    search_type: str = "repositories",
+    max_results: int = 5
+) -> str:
     """
-    Search GitHub for repositories, code, or issues.
+    Search GitHub for repositories, code, issues, or users.
+
     Args:
-        query: Search terms.
-        search_type: One of 'repositories', 'code', 'issues', 'users' (default: repositories).
-        max_results: Number of results to return (default 5, max 10).
+        query: GitHub search query, e.g. "langgraph python".
+        search_type: One of:
+            - repositories
+            - code
+            - issues
+            - users
+        max_results: Number of results to return (1-10).
+
+    Returns:
+        Formatted GitHub search results.
     """
+
     try:
-        valid_types = {"repositories", "code", "issues", "users"}
-        if search_type not in valid_types:
-            search_type = "repositories"
-        url = f"https://api.github.com/search/{search_type}"
-        headers = {"Accept": "application/vnd.github+json"}
+        # ========================================================
+        # 1. Normalize search type
+        # ========================================================
+
+        search_type = str(search_type).strip().lower()
+
+        aliases = {
+            "repo": "repositories",
+            "repos": "repositories",
+            "repository": "repositories",
+            "repositories": "repositories",
+
+            "code": "code",
+
+            "issue": "issues",
+            "issues": "issues",
+
+            "user": "users",
+            "users": "users",
+        }
+
+        if search_type not in aliases:
+            return (
+                "❌ Invalid GitHub search type.\n\n"
+                f"You provided: `{search_type}`\n\n"
+                "Valid options are:\n"
+                "- `repositories`\n"
+                "- `code`\n"
+                "- `issues`\n"
+                "- `users`"
+            )
+
+        search_type = aliases[search_type]
+
+        # ========================================================
+        # 2. Validate query
+        # ========================================================
+
+        query = str(query).strip()
+
+        if not query:
+            return "❌ GitHub search query cannot be empty."
+
+        # ========================================================
+        # 3. Validate result count
+        # ========================================================
+
+        try:
+            max_results = int(max_results)
+        except (TypeError, ValueError):
+            max_results = 5
+
+        max_results = max(1, min(max_results, 10))
+
+        # ========================================================
+        # 4. GitHub API configuration
+        # ========================================================
+
+        api_url = f"https://api.github.com/search/{search_type}"
+
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2026-03-10",
+            "User-Agent": "LangGraph-Chatbot",
+        }
+
+        # ========================================================
+        # 5. GitHub authentication
+        # ========================================================
+
         token = os.getenv("GITHUB_TOKEN")
+
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        resp = requests.get(url, headers=headers, params={"q": query, "per_page": min(max_results, 10)}, timeout=10)
-        data = resp.json()
-        items = data.get("items", [])
-        if not items:
-            return f"No GitHub {search_type} found for '{query}'."
-        results = []
-        for item in items:
-            if search_type == "repositories":
-                results.append(
-                    f"⭐ **{item.get('full_name')}** ({item.get('stargazers_count', 0)} stars)\n"
-                    f"   {item.get('description', 'No description')}\n"
-                    f"   Language: {item.get('language', 'Unknown')} | Forks: {item.get('forks_count', 0)}\n"
-                    f"   🔗 {item.get('html_url')}"
-                )
-            elif search_type == "issues":
-                results.append(
-                    f"🐛 **{item.get('title')}**\n"
-                    f"   State: {item.get('state')} | Comments: {item.get('comments', 0)}\n"
-                    f"   🔗 {item.get('html_url')}"
-                )
-            else:
-                results.append(
-                    f"• **{item.get('full_name') or item.get('login') or item.get('name')}**\n"
-                    f"   🔗 {item.get('html_url')}"
-                )
-        total = data.get("total_count", len(items))
-        return f"🐙 GitHub {search_type} for: *{query}* ({total:,} total)\n\n" + "\n\n".join(results)
-    except Exception as exc:
-        return f"GitHub search error: {exc}"
 
+        params = {
+            "q": query,
+            "per_page": max_results,
+        }
+
+        # ========================================================
+        # 6. Make API request
+        # ========================================================
+
+        response = requests.get(
+            api_url,
+            headers=headers,
+            params=params,
+            timeout=15,
+        )
+
+        # ========================================================
+        # 7. Parse response safely
+        # ========================================================
+
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+
+        # ========================================================
+        # 8. Detailed HTTP error handling
+        # ========================================================
+
+        if response.status_code == 401:
+            return (
+                "❌ **GitHub authentication failed**\n\n"
+                f"HTTP status: `{response.status_code}`\n\n"
+                "Your GITHUB_TOKEN may be invalid, expired, "
+                "or incorrectly configured in `.env`."
+            )
+
+        if response.status_code == 403:
+
+            message = data.get(
+                "message",
+                "GitHub denied the request."
+            )
+
+            return (
+                "❌ **GitHub API access denied**\n\n"
+                f"HTTP status: `{response.status_code}`\n"
+                f"GitHub message: `{message}`\n\n"
+                "This may be caused by an API rate limit "
+                "or insufficient authentication/permissions."
+            )
+
+        if response.status_code == 404:
+            return (
+                "❌ **GitHub API endpoint not found**\n\n"
+                f"HTTP status: `{response.status_code}`\n"
+                f"Endpoint: `{api_url}`"
+            )
+
+        if response.status_code == 422:
+
+            message = data.get(
+                "message",
+                "GitHub rejected the search request."
+            )
+
+            errors = data.get("errors", [])
+
+            error_details = ""
+
+            if errors:
+                error_details = (
+                    "\n\nDetails:\n"
+                    + "\n".join(
+                        str(error)
+                        for error in errors
+                    )
+                )
+
+            return (
+                "❌ **GitHub search request rejected**\n\n"
+                f"HTTP status: `{response.status_code}`\n"
+                f"GitHub message: `{message}`"
+                f"{error_details}"
+            )
+
+        if response.status_code == 429:
+            return (
+                "❌ **GitHub API rate limit exceeded**\n\n"
+                f"HTTP status: `{response.status_code}`\n\n"
+                "Please wait and try again later."
+            )
+
+        if not response.ok:
+            message = data.get(
+                "message",
+                "Unknown GitHub API error."
+            )
+
+            return (
+                "❌ **GitHub API error**\n\n"
+                f"HTTP status: `{response.status_code}`\n"
+                f"Message: `{message}`"
+            )
+
+        # ========================================================
+        # 9. Extract search results
+        # ========================================================
+
+        items = data.get("items", [])
+
+        total = data.get(
+            "total_count",
+            len(items)
+        )
+
+        # ========================================================
+        # 10. Important diagnostic for CODE search
+        # ========================================================
+
+        if search_type == "code" and not items:
+
+            return (
+                "🐙 **GitHub Code Search**\n\n"
+                f"**Query:** `{query}`\n"
+                f"**HTTP status:** `{response.status_code}`\n"
+                f"**Total matches reported by GitHub:** `{total}`\n"
+                f"**Results returned:** `0`\n\n"
+                "⚠️ GitHub returned no code items for this "
+                "request.\n\n"
+                "This is different from the API request failing. "
+                "The request itself completed successfully."
+            )
+
+        # ========================================================
+        # 11. No results for other searches
+        # ========================================================
+
+        if not items:
+
+            return (
+                f"🐙 **GitHub {search_type.title()} Search**\n\n"
+                f"**Query:** `{query}`\n"
+                f"**HTTP status:** `{response.status_code}`\n\n"
+                "No matching results were returned by GitHub."
+            )
+
+        # ========================================================
+        # 12. Format results
+        # ========================================================
+
+        results = []
+
+        for index, item in enumerate(
+            items,
+            start=1
+        ):
+
+            # ====================================================
+            # REPOSITORIES
+            # ====================================================
+
+            if search_type == "repositories":
+
+                repo_name = item.get(
+                    "full_name",
+                    "Unknown repository"
+                )
+
+                description = (
+                    item.get("description")
+                    or "No description"
+                )
+
+                language = (
+                    item.get("language")
+                    or "Unknown"
+                )
+
+                stars = item.get(
+                    "stargazers_count",
+                    0
+                )
+
+                forks = item.get(
+                    "forks_count",
+                    0
+                )
+
+                open_issues = item.get(
+                    "open_issues_count",
+                    0
+                )
+
+                html_url = item.get(
+                    "html_url",
+                    ""
+                )
+
+                results.append(
+                    f"### {index}. ⭐ {repo_name}\n"
+                    f"**Description:** {description}\n"
+                    f"**Language:** {language}\n"
+                    f"**Stars:** {stars:,}\n"
+                    f"**Forks:** {forks:,}\n"
+                    f"**Open issues:** {open_issues:,}\n"
+                    f"🔗 {html_url}"
+                )
+
+            # ====================================================
+            # CODE
+            # ====================================================
+
+            elif search_type == "code":
+
+                repository = item.get(
+                    "repository",
+                    {}
+                )
+
+                repo_name = repository.get(
+                    "full_name",
+                    "Unknown repository"
+                )
+
+                path = item.get(
+                    "path",
+                    "Unknown file"
+                )
+
+                html_url = item.get(
+                    "html_url",
+                    ""
+                )
+
+                results.append(
+                    f"### {index}. 💻 {repo_name}\n"
+                    f"**File:** `{path}`\n"
+                    f"🔗 {html_url}"
+                )
+
+            # ====================================================
+            # ISSUES
+            # ====================================================
+
+            elif search_type == "issues":
+
+                title = item.get(
+                    "title",
+                    "Untitled issue"
+                )
+
+                state = item.get(
+                    "state",
+                    "unknown"
+                )
+
+                comments = item.get(
+                    "comments",
+                    0
+                )
+
+                html_url = item.get(
+                    "html_url",
+                    ""
+                )
+
+                # GitHub search/issues also returns pull
+                # requests. Detect them so the UI is clear.
+
+                is_pull_request = bool(
+                    item.get("pull_request")
+                )
+
+                item_type = (
+                    "Pull Request"
+                    if is_pull_request
+                    else "Issue"
+                )
+
+                repository_url = item.get(
+                    "repository_url",
+                    ""
+                )
+
+                repository_name = (
+                    repository_url
+                    .replace(
+                        "https://api.github.com/repos/",
+                        ""
+                    )
+                    if repository_url
+                    else "Unknown repository"
+                )
+
+                results.append(
+                    f"### {index}. 🐛 {title}\n"
+                    f"**Type:** {item_type}\n"
+                    f"**Repository:** {repository_name}\n"
+                    f"**State:** {state}\n"
+                    f"**Comments:** {comments:,}\n"
+                    f"🔗 {html_url}"
+                )
+
+            # ====================================================
+            # USERS
+            # ====================================================
+
+            elif search_type == "users":
+
+                login = item.get(
+                    "login",
+                    item.get(
+                        "name",
+                        "Unknown user"
+                    )
+                )
+
+                user_type = item.get(
+                    "type",
+                    "User"
+                )
+
+                html_url = item.get(
+                    "html_url",
+                    ""
+                )
+
+                results.append(
+                    f"### {index}. 👤 {login}\n"
+                    f"**Type:** {user_type}\n"
+                    f"🔗 {html_url}"
+                )
+
+        # ========================================================
+        # 13. Final response
+        # ========================================================
+
+        return (
+            f"🐙 **GitHub {search_type.title()} Search**\n\n"
+            f"**Query:** `{query}`\n"
+            f"**HTTP status:** `{response.status_code}`\n"
+            f"**Results:** {len(items)} of "
+            f"{total:,} total matches\n\n"
+            + "\n\n".join(results)
+        )
+
+    # ============================================================
+    # Network errors
+    # ============================================================
+
+    except requests.exceptions.Timeout:
+
+        return (
+            "❌ **GitHub search timed out.**\n\n"
+            "GitHub did not respond within 15 seconds. "
+            "Please try again."
+        )
+
+    except requests.exceptions.ConnectionError:
+
+        return (
+            "❌ **Could not connect to GitHub.**\n\n"
+            "Check your internet connection and try again."
+        )
+
+    except requests.exceptions.RequestException as exc:
+
+        return (
+            f"❌ **GitHub request failed:**\n\n"
+            f"`{exc}`"
+        )
+
+    except Exception as exc:
+
+        return (
+            f"❌ **Unexpected GitHub search error:**\n\n"
+            f"`{exc}`"
+        )
+    
 
 @tool
 def lint_code(code: str, language: str = "python") -> str:
     """
-    Lint Python code and return style issues and errors.
+    Lint source code and report syntax, style, and common Python issues.
+
     Args:
-        code: The source code to lint.
-        language: Programming language (currently supports 'python').
+        code: The source code to analyze.
+        language: Programming language. Currently supports Python.
+
+    Returns:
+        Human-readable linting results.
     """
-    if language.lower() != "python":
-        return f"Linting for '{language}' is not yet supported. Only Python is supported."
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(code)
-            tmp_path = f.name
-        result = subprocess.run(
-            ["python3", "-m", "py_compile", tmp_path],
-            capture_output=True, text=True, timeout=10
+
+    # ============================================================
+    # 1. Validate language
+    # ============================================================
+
+    language = str(language).strip().lower()
+
+    if language not in {"python", "py"}:
+        return (
+            f"❌ Linting for `{language}` is not currently supported.\n\n"
+            "Supported language:\n"
+            "• Python"
         )
-        syntax_errors = result.stderr.strip()
-        os.unlink(tmp_path)
-        if syntax_errors:
-            return f"❌ Syntax errors found:\n```\n{syntax_errors}\n```"
-        # Also check with ast
+
+    # ============================================================
+    # 2. Validate code input
+    # ============================================================
+
+    if not isinstance(code, str) or not code.strip():
+        return "❌ No code was provided to lint."
+
+    tmp_path = None
+
+    try:
+        # ========================================================
+        # 3. Create temporary Python file
+        # ========================================================
+
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".py",
+            delete=False,
+            encoding="utf-8"
+        ) as temp_file:
+
+            temp_file.write(code)
+            tmp_path = temp_file.name
+
+        # ========================================================
+        # 4. First: syntax validation
+        # ========================================================
+
         try:
             ast.parse(code)
-            return "✅ No syntax errors found. Code looks valid."
-        except SyntaxError as e:
-            return f"❌ Syntax error at line {e.lineno}: {e.msg}\n```\n{e.text}\n```"
+        except SyntaxError as exc:
+
+            line = exc.lineno or 0
+            column = exc.offset or 0
+            message = exc.msg or "Invalid syntax"
+
+            source_line = (
+                exc.text.strip()
+                if exc.text
+                else ""
+            )
+
+            pointer = ""
+
+            if column > 0:
+                pointer = " " * (column - 1) + "^"
+
+            return (
+                "❌ **Python syntax error**\n\n"
+                f"**Line:** `{line}`\n"
+                f"**Column:** `{column}`\n"
+                f"**Error:** {message}\n\n"
+                "```python\n"
+                f"{source_line}\n"
+                f"{pointer}\n"
+                "```"
+            )
+
+        # ========================================================
+        # 5. Check that Ruff is installed
+        # ========================================================
+
+        try:
+            ruff_check = subprocess.run(
+                ["ruff", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+
+        except FileNotFoundError:
+
+            return (
+                "⚠️ **Ruff is not installed.**\n\n"
+                "The Python syntax is valid, but advanced "
+                "linting cannot run.\n\n"
+                "Install Ruff with:\n\n"
+                "```bash\n"
+                "pip install ruff\n"
+                "```"
+            )
+
+        if ruff_check.returncode != 0:
+
+            return (
+                "⚠️ **Ruff could not be started.**\n\n"
+                f"{ruff_check.stderr.strip()}"
+            )
+
+        # ========================================================
+        # 6. Run Ruff
+        # ========================================================
+
+        result = subprocess.run(
+            [
+                "ruff",
+                "check",
+                tmp_path,
+                "--output-format",
+                "json"
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+
+        # ========================================================
+        # 7. Parse Ruff JSON
+        # ========================================================
+
+        try:
+            diagnostics = json.loads(
+                result.stdout
+            ) if result.stdout.strip() else []
+
+        except json.JSONDecodeError:
+
+            return (
+                "⚠️ **Ruff returned an unexpected response.**\n\n"
+                "```text\n"
+                f"{result.stdout.strip()}\n"
+                f"{result.stderr.strip()}\n"
+                "```"
+            )
+
+        # ========================================================
+        # 8. No issues
+        # ========================================================
+
+        if not diagnostics:
+
+            return (
+                "✅ **Python code passed linting.**\n\n"
+                "• Syntax: Valid\n"
+                "• Ruff: No issues found\n"
+                "• Style: OK\n"
+                "• Common lint checks: OK"
+            )
+
+        # ========================================================
+        # 9. Format diagnostics
+        # ========================================================
+
+        errors = 0
+        warnings = 0
+
+        formatted_results = []
+
+        for index, diagnostic in enumerate(
+            diagnostics,
+            start=1
+        ):
+
+            code_id = diagnostic.get(
+                "code",
+                "UNKNOWN"
+            )
+
+            message = diagnostic.get(
+                "message",
+                "Unknown lint issue"
+            )
+
+            location = diagnostic.get(
+                "location",
+                {}
+            )
+
+            row = location.get(
+                "row",
+                "?"
+            )
+
+            column = location.get(
+                "column",
+                "?"
+            )
+
+            end_location = diagnostic.get(
+                "end_location",
+                {}
+            )
+
+            end_row = end_location.get(
+                "row",
+                row
+            )
+
+            end_column = end_location.get(
+                "column",
+                column
+            )
+
+            fix = diagnostic.get(
+                "fix"
+            )
+
+            # Ruff's default output contains rule codes.
+            # Treat E/F errors as errors and others as warnings.
+            if code_id.startswith(("E", "F")):
+                severity = "❌"
+                errors += 1
+            else:
+                severity = "⚠️"
+                warnings += 1
+
+            location_text = (
+                f"line {row}, column {column}"
+            )
+
+            if (
+                end_row != row
+                or end_column != column
+            ):
+                location_text += (
+                    f" → line {end_row}, "
+                    f"column {end_column}"
+                )
+
+            fix_text = ""
+
+            if fix:
+                fix_text = (
+                    "\n"
+                    "   🔧 **Automatic fix available**"
+                )
+
+            formatted_results.append(
+                f"### {index}. {severity} `{code_id}`\n"
+                f"**Location:** {location_text}\n"
+                f"**Issue:** {message}"
+                f"{fix_text}"
+            )
+
+        # ========================================================
+        # 10. Final report
+        # ========================================================
+
+        return (
+            "🐍 **Python Code Lint Report**\n\n"
+            "### Summary\n"
+            f"• Syntax: ✅ Valid\n"
+            f"• Issues found: **{len(diagnostics)}**\n"
+            f"• Errors: **{errors}**\n"
+            f"• Warnings: **{warnings}**\n\n"
+            + "\n\n".join(formatted_results)
+        )
+
+    # ============================================================
+    # 11. Timeout
+    # ============================================================
+
+    except subprocess.TimeoutExpired:
+
+        return (
+            "❌ **Linting timed out.**\n\n"
+            "Ruff did not finish within 15 seconds."
+        )
+
+    # ============================================================
+    # 12. General errors
+    # ============================================================
+
     except Exception as exc:
-        return f"Lint error: {exc}"
+
+        return (
+            "❌ **Linting error**\n\n"
+            f"`{exc}`"
+        )
+
+    # ============================================================
+    # 13. Always clean up temporary file
+    # ============================================================
+
+    finally:
+
+        if tmp_path:
+
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+            except OSError:
+                pass
+
 
 
 # ============================================================
-# ── NEW: FINANCE & CRYPTO TOOLS ─────────────────────────────
+# FINANCE & CRYPTO TOOLS
+# ============================================================
+
+def _safe_float(value, default=None):
+    """Convert a value to float safely."""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_number(value, decimals=2, prefix=""):
+    """Format numeric values safely."""
+    number = _safe_float(value)
+
+    if number is None:
+        return "N/A"
+
+    return f"{prefix}{number:,.{decimals}f}"
+
+
+def _format_market_cap(value):
+    """Format large market-cap values."""
+    number = _safe_float(value)
+
+    if number is None or number == 0:
+        return "N/A"
+
+    if abs(number) >= 1_000_000_000_000:
+        return f"${number / 1_000_000_000_000:.2f}T"
+
+    if abs(number) >= 1_000_000_000:
+        return f"${number / 1_000_000_000:.2f}B"
+
+    if abs(number) >= 1_000_000:
+        return f"${number / 1_000_000:.2f}M"
+
+    return f"${number:,.0f}"
+
+
+def _get_yfinance():
+    """
+    Import yfinance lazily and configure modest retries.
+    """
+    try:
+        import yfinance as yf
+
+        # Retry transient network failures.
+        try:
+            yf.config.network.retries = 2
+        except Exception:
+            pass
+
+        return yf
+
+    except ImportError:
+        raise ImportError(
+            "The 'yfinance' package is not installed. "
+            "Install it with: pip install yfinance"
+        )
+
+
+# ============================================================
+# 1. STOCK PRICE
 # ============================================================
 
 @tool
 def get_stock_price(symbol: str) -> str:
     """
-    Get the current stock price and key metrics for any publicly traded company.
-    Args:
-        symbol: Stock ticker symbol (e.g. 'AAPL', 'GOOGL', 'TSLA', 'MSFT').
-    """
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker(symbol.upper())
-        info = ticker.info
-        hist = ticker.history(period="2d")
-        if hist.empty:
-            return f"No data found for ticker '{symbol}'. Please check the symbol."
-        current = hist["Close"].iloc[-1]
-        prev_close = hist["Close"].iloc[0] if len(hist) > 1 else current
-        change = current - prev_close
-        change_pct = (change / prev_close) * 100 if prev_close else 0
-        direction = "📈" if change >= 0 else "📉"
-        return (
-            f"{direction} **{info.get('shortName', symbol.upper())} ({symbol.upper()})**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• Current Price:  ${current:.2f}\n"
-            f"• Change:         {'+' if change >= 0 else ''}{change:.2f} ({change_pct:+.2f}%)\n"
-            f"• Market Cap:     ${info.get('marketCap', 0):,.0f}\n"
-            f"• 52-Week High:   ${info.get('fiftyTwoWeekHigh', 'N/A')}\n"
-            f"• 52-Week Low:    ${info.get('fiftyTwoWeekLow', 'N/A')}\n"
-            f"• P/E Ratio:      {info.get('trailingPE', 'N/A')}\n"
-            f"• Volume:         {info.get('volume', 'N/A'):,}"
-        )
-    except ImportError:
-        return "The 'yfinance' package is not installed. Run: pip install yfinance"
-    except Exception as exc:
-        return f"Stock price error: {exc}"
+    Get current stock price and key market metrics.
 
+    Args:
+        symbol:
+            Stock ticker symbol, e.g. AAPL, GOOGL, TSLA, MSFT.
+
+    Returns:
+        Current price, daily change, market cap, 52-week range,
+        P/E ratio, volume, and company name.
+    """
+
+    symbol = str(symbol).strip().upper()
+
+    if not symbol:
+        return "❌ Please provide a stock ticker symbol."
+
+    # Basic length protection.
+    if len(symbol) > 20:
+        return "❌ Invalid ticker symbol."
+
+    try:
+        yf = _get_yfinance()
+
+        ticker = yf.Ticker(symbol)
+
+        # --------------------------------------------------------
+        # Price history
+        # --------------------------------------------------------
+
+        hist = ticker.history(
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            timeout=10
+        )
+
+        if hist.empty:
+            return (
+                f"❌ No market data found for `{symbol}`.\n\n"
+                "Please check that the ticker symbol is correct."
+            )
+
+        closes = hist["Close"].dropna()
+
+        if closes.empty:
+            return (
+                f"❌ No closing-price data available for `{symbol}`."
+            )
+
+        current = _safe_float(closes.iloc[-1])
+
+        if current is None:
+            return (
+                f"❌ Could not determine the current price for `{symbol}`."
+            )
+
+        # --------------------------------------------------------
+        # Previous close
+        # --------------------------------------------------------
+
+        previous = (
+            _safe_float(closes.iloc[-2])
+            if len(closes) >= 2
+            else current
+        )
+
+        if previous is None or previous == 0:
+            change = 0.0
+            change_pct = 0.0
+        else:
+            change = current - previous
+            change_pct = (change / previous) * 100
+
+        direction = "📈" if change >= 0 else "📉"
+
+        # --------------------------------------------------------
+        # Company information
+        # --------------------------------------------------------
+
+        try:
+            info = ticker.info or {}
+        except Exception:
+            info = {}
+
+        company_name = (
+            info.get("longName")
+            or info.get("shortName")
+            or symbol
+        )
+
+        currency = (
+            info.get("currency")
+            or "USD"
+        )
+
+        market_cap = info.get("marketCap")
+        week_high = info.get("fiftyTwoWeekHigh")
+        week_low = info.get("fiftyTwoWeekLow")
+        pe_ratio = info.get("trailingPE")
+        volume = info.get("volume")
+
+        # --------------------------------------------------------
+        # Format output
+        # --------------------------------------------------------
+
+        return (
+            f"{direction} **{company_name} ({symbol})**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• Current Price:  "
+            f"{currency} {current:,.2f}\n"
+            f"• Daily Change:   "
+            f"{change:+,.2f} ({change_pct:+.2f}%)\n"
+            f"• Market Cap:     "
+            f"{_format_market_cap(market_cap)}\n"
+            f"• 52-Week High:   "
+            f"{_format_number(week_high, 2, currency + ' ')}\n"
+            f"• 52-Week Low:    "
+            f"{_format_number(week_low, 2, currency + ' ')}\n"
+            f"• P/E Ratio:      "
+            f"{_format_number(pe_ratio, 2)}\n"
+            f"• Volume:         "
+            f"{_format_number(volume, 0)}\n"
+            f"\n_Source: Yahoo Finance via yfinance._"
+        )
+
+    except ImportError as exc:
+        return f"❌ {exc}"
+
+    except Exception as exc:
+        return (
+            f"❌ **Stock price error for `{symbol}`**\n\n"
+            f"`{exc}`"
+        )
+
+
+# ============================================================
+# 2. CRYPTO PRICE
+# ============================================================
 
 @tool
 def get_crypto_price(coin_id: str) -> str:
     """
-    Get the current price and market data for any cryptocurrency via CoinGecko API (free, no key needed).
-    Args:
-        coin_id: CoinGecko coin ID (e.g. 'bitcoin', 'ethereum', 'solana', 'dogecoin').
-    """
-    try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        resp = requests.get(url, params={
-            "vs_currency": "usd",
-            "ids": coin_id.lower(),
-            "price_change_percentage": "24h"
-        }, timeout=10)
-        data = resp.json()
-        if not data:
-            return f"No data found for crypto '{coin_id}'. Check the coin ID (e.g. 'bitcoin', 'ethereum')."
-        c = data[0]
-        change_24h = c.get("price_change_percentage_24h", 0) or 0
-        direction = "📈" if change_24h >= 0 else "📉"
-        return (
-            f"{direction} **{c.get('name')} ({c.get('symbol', '').upper()})**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• Current Price:   ${c.get('current_price', 0):,.4f}\n"
-            f"• 24h Change:      {change_24h:+.2f}%\n"
-            f"• Market Cap:      ${c.get('market_cap', 0):,.0f}\n"
-            f"• 24h Volume:      ${c.get('total_volume', 0):,.0f}\n"
-            f"• 24h High:        ${c.get('high_24h', 0):,.4f}\n"
-            f"• 24h Low:         ${c.get('low_24h', 0):,.4f}\n"
-            f"• All-Time High:   ${c.get('ath', 0):,.4f}\n"
-            f"• Rank:            #{c.get('market_cap_rank', 'N/A')}"
-        )
-    except Exception as exc:
-        return f"Crypto price error: {exc}"
+    Get current cryptocurrency market data from CoinGecko.
 
+    Args:
+        coin_id:
+            CoinGecko coin ID, e.g. bitcoin, ethereum, solana,
+            dogecoin.
+
+    Returns:
+        Current price, 24h change, market cap, volume,
+        24h high/low, ATH, and market rank.
+    """
+
+    coin_id = str(coin_id).strip().lower()
+
+    if not coin_id:
+        return "❌ Please provide a CoinGecko coin ID."
+
+    # CoinGecko IDs normally use lowercase letters,
+    # numbers and hyphens.
+    if len(coin_id) > 100:
+        return "❌ Invalid cryptocurrency ID."
+
+    try:
+        url = (
+            "https://api.coingecko.com/api/v3/"
+            "coins/markets"
+        )
+
+        params = {
+            "vs_currency": "usd",
+            "ids": coin_id,
+            "price_change_percentage": "24h",
+        }
+
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "LangGraph-Finance-Tool/1.0",
+        }
+
+        # Optional CoinGecko Demo API key.
+        #
+        # If COINGECKO_API_KEY is not configured,
+        # CoinGecko's keyless public API is used.
+        api_key = os.getenv("COINGECKO_API_KEY")
+
+        if api_key:
+            headers["x-cg-demo-api-key"] = api_key
+
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=15,
+        )
+
+        # --------------------------------------------------------
+        # HTTP errors
+        # --------------------------------------------------------
+
+        if response.status_code == 401:
+            return (
+                "❌ **CoinGecko authentication failed.**\n\n"
+                "Check your `COINGECKO_API_KEY`."
+            )
+
+        if response.status_code == 429:
+            return (
+                "❌ **CoinGecko rate limit reached.**\n\n"
+                "Please wait and try again later."
+            )
+
+        if not response.ok:
+            return (
+                "❌ **CoinGecko API error**\n\n"
+                f"HTTP status: `{response.status_code}`\n"
+                f"Message: `{response.text[:500]}`"
+            )
+
+        data = response.json()
+
+        if not isinstance(data, list) or not data:
+            return (
+                f"❌ No cryptocurrency found for "
+                f"`{coin_id}`.\n\n"
+                "Use the CoinGecko coin ID, for example:\n"
+                "• bitcoin\n"
+                "• ethereum\n"
+                "• solana\n"
+                "• dogecoin"
+            )
+
+        coin = data[0]
+
+        name = coin.get("name") or coin_id
+        symbol = str(
+            coin.get("symbol") or ""
+        ).upper()
+
+        current_price = _safe_float(
+            coin.get("current_price")
+        )
+
+        change_24h = _safe_float(
+            coin.get("price_change_percentage_24h"),
+            0.0
+        )
+
+        direction = (
+            "📈"
+            if change_24h >= 0
+            else "📉"
+        )
+
+        return (
+            f"{direction} **{name} ({symbol})**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• Current Price: "
+            f"${_format_number(current_price, 6)}\n"
+            f"• 24h Change:    "
+            f"{change_24h:+.2f}%\n"
+            f"• Market Cap:    "
+            f"{_format_market_cap(coin.get('market_cap'))}\n"
+            f"• 24h Volume:    "
+            f"{_format_market_cap(coin.get('total_volume'))}\n"
+            f"• 24h High:      "
+            f"${_format_number(coin.get('high_24h'), 6)}\n"
+            f"• 24h Low:       "
+            f"${_format_number(coin.get('low_24h'), 6)}\n"
+            f"• All-Time High: "
+            f"${_format_number(coin.get('ath'), 6)}\n"
+            f"• Market Rank:   "
+            f"#{coin.get('market_cap_rank', 'N/A')}\n"
+            f"\n_Source: CoinGecko_"
+        )
+
+    except requests.exceptions.Timeout:
+        return (
+            "❌ CoinGecko request timed out. "
+            "Please try again."
+        )
+
+    except requests.exceptions.ConnectionError:
+        return (
+            "❌ Could not connect to CoinGecko. "
+            "Check your internet connection."
+        )
+
+    except ValueError:
+        return (
+            "❌ CoinGecko returned invalid JSON data."
+        )
+
+    except Exception as exc:
+        return (
+            f"❌ **Crypto price error**\n\n"
+            f"`{exc}`"
+        )
+
+
+# ============================================================
+# 3. FOREX RATE
+# ============================================================
 
 @tool
-def get_forex_rate(from_currency: str, to_currency: str) -> str:
+def get_forex_rate(
+    from_currency: str,
+    to_currency: str
+) -> str:
     """
-    Get the current foreign exchange rate between two currencies.
-    Uses yfinance — free and no API key required.
-    Args:
-        from_currency: Source currency code (e.g. 'USD', 'EUR', 'NPR', 'GBP').
-        to_currency: Target currency code (e.g. 'EUR', 'JPY', 'INR', 'AUD').
-    """
-    try:
-        import yfinance as yf
-        pair = f"{from_currency.upper()}{to_currency.upper()}=X"
-        ticker = yf.Ticker(pair)
-        hist = ticker.history(period="2d")
-        if hist.empty:
-            return f"Could not fetch exchange rate for {from_currency}/{to_currency}."
-        rate = hist["Close"].iloc[-1]
-        prev = hist["Close"].iloc[0] if len(hist) > 1 else rate
-        change = rate - prev
-        change_pct = (change / prev) * 100 if prev else 0
-        return (
-            f"💱 **{from_currency.upper()} → {to_currency.upper()}**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• Rate:    1 {from_currency.upper()} = {rate:.4f} {to_currency.upper()}\n"
-            f"• Change:  {change:+.4f} ({change_pct:+.2f}% today)"
-        )
-    except ImportError:
-        return "The 'yfinance' package is not installed. Run: pip install yfinance"
-    except Exception as exc:
-        return f"Forex rate error: {exc}"
+    Get the latest available FX rate using Yahoo Finance.
 
+    Args:
+        from_currency:
+            Three-letter currency code, e.g. USD, EUR, NPR.
+
+        to_currency:
+            Three-letter currency code, e.g. USD, EUR, INR, JPY.
+
+    Returns:
+        Latest available exchange rate and recent change.
+    """
+
+    from_currency = str(
+        from_currency
+    ).strip().upper()
+
+    to_currency = str(
+        to_currency
+    ).strip().upper()
+
+    if len(from_currency) != 3:
+        return (
+            f"❌ Invalid source currency: "
+            f"`{from_currency}`"
+        )
+
+    if len(to_currency) != 3:
+        return (
+            f"❌ Invalid target currency: "
+            f"`{to_currency}`"
+        )
+
+    if from_currency == to_currency:
+        return (
+            f"💱 **{from_currency} → {to_currency}**\n\n"
+            f"1 {from_currency} = 1.0000 {to_currency}"
+        )
+
+    try:
+        yf = _get_yfinance()
+
+        pair = (
+            f"{from_currency}"
+            f"{to_currency}=X"
+        )
+
+        ticker = yf.Ticker(pair)
+
+        hist = ticker.history(
+            period="5d",
+            interval="1d",
+            auto_adjust=False,
+            timeout=10
+        )
+
+        if hist.empty:
+            return (
+                f"❌ Could not fetch FX data for "
+                f"`{from_currency}/{to_currency}`."
+            )
+
+        closes = hist["Close"].dropna()
+
+        if closes.empty:
+            return (
+                f"❌ No exchange-rate data available "
+                f"for `{from_currency}/{to_currency}`."
+            )
+
+        rate = _safe_float(closes.iloc[-1])
+
+        if rate is None:
+            return "❌ Could not determine the exchange rate."
+
+        previous = (
+            _safe_float(closes.iloc[-2])
+            if len(closes) >= 2
+            else rate
+        )
+
+        if previous and previous != 0:
+            change = rate - previous
+            change_pct = (
+                change / previous
+            ) * 100
+        else:
+            change = 0.0
+            change_pct = 0.0
+
+        direction = (
+            "📈"
+            if change >= 0
+            else "📉"
+        )
+
+        return (
+            f"💱 **{from_currency} → {to_currency}**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• Rate:       "
+            f"1 {from_currency} = "
+            f"{rate:.6f} {to_currency}\n"
+            f"• Change:     "
+            f"{change:+.6f} ({change_pct:+.2f}%) {direction}\n"
+            f"\n_Source: Yahoo Finance via yfinance._"
+        )
+
+    except ImportError as exc:
+        return f"❌ {exc}"
+
+    except Exception as exc:
+        return (
+            f"❌ **Forex rate error**\n\n"
+            f"`{exc}`"
+        )
+
+
+# ============================================================
+# 4. PORTFOLIO CALCULATOR
+# ============================================================
 
 @tool
 def portfolio_calculator(holdings: str) -> str:
     """
-    Calculate total portfolio value given a list of stock/crypto holdings.
+    Calculate the current approximate value of stock/crypto holdings.
+
     Args:
-        holdings: Comma-separated list in format 'SYMBOL:QUANTITY' 
-                  e.g. 'AAPL:10,GOOGL:5,BTC-USD:0.5'
-                  Use standard ticker symbols. For crypto use yfinance format like BTC-USD.
+        holdings:
+            Comma-separated SYMBOL:QUANTITY values.
+
+            Examples:
+                AAPL:10,GOOGL:5
+                AAPL:10,BTC-USD:0.5
+
+            For cryptocurrency, use Yahoo Finance symbols such as
+            BTC-USD and ETH-USD.
+
+    Returns:
+        Position-by-position values and total portfolio value.
     """
+
+    if not isinstance(holdings, str):
+        return "❌ Holdings must be provided as text."
+
+    holdings = holdings.strip()
+
+    if not holdings:
+        return (
+            "❌ No holdings provided.\n\n"
+            "Example:\n"
+            "`AAPL:10,GOOGL:5,BTC-USD:0.5`"
+        )
+
     try:
-        import yfinance as yf
-        items = [h.strip() for h in holdings.split(",")]
-        rows = []
+        yf = _get_yfinance()
+
+        items = [
+            item.strip()
+            for item in holdings.split(",")
+            if item.strip()
+        ]
+
+        if not items:
+            return "❌ No valid holdings found."
+
+        positions = []
         total = 0.0
+
         for item in items:
+
+            # ----------------------------------------------------
+            # Validate format
+            # ----------------------------------------------------
+
             if ":" not in item:
+                positions.append({
+                    "symbol": item,
+                    "error": (
+                        "Invalid format. "
+                        "Use SYMBOL:QUANTITY"
+                    )
+                })
                 continue
+
             symbol, qty_str = item.split(":", 1)
+
             symbol = symbol.strip().upper()
-            qty = float(qty_str.strip())
+            qty_str = qty_str.strip()
+
+            if not symbol:
+                positions.append({
+                    "symbol": "Unknown",
+                    "error": "Missing symbol"
+                })
+                continue
+
+            try:
+                quantity = float(qty_str)
+            except ValueError:
+                positions.append({
+                    "symbol": symbol,
+                    "error": (
+                        f"Invalid quantity `{qty_str}`"
+                    )
+                })
+                continue
+
+            if quantity <= 0:
+                positions.append({
+                    "symbol": symbol,
+                    "error": (
+                        "Quantity must be greater than zero"
+                    )
+                })
+                continue
+
+            # ----------------------------------------------------
+            # Fetch price
+            # ----------------------------------------------------
+
             try:
                 ticker = yf.Ticker(symbol)
-                hist = ticker.history(period="1d")
+
+                hist = ticker.history(
+                    period="5d",
+                    interval="1d",
+                    auto_adjust=False,
+                    timeout=10
+                )
+
                 if hist.empty:
-                    rows.append(f"• {symbol}: ❌ No data found")
+                    positions.append({
+                        "symbol": symbol,
+                        "error": "No market data found"
+                    })
                     continue
-                price = hist["Close"].iloc[-1]
-                value = price * qty
+
+                closes = hist["Close"].dropna()
+
+                if closes.empty:
+                    positions.append({
+                        "symbol": symbol,
+                        "error": "No closing price available"
+                    })
+                    continue
+
+                price = _safe_float(
+                    closes.iloc[-1]
+                )
+
+                if price is None:
+                    positions.append({
+                        "symbol": symbol,
+                        "error": "Invalid price returned"
+                    })
+                    continue
+
+                value = price * quantity
+
                 total += value
-                rows.append(f"• {symbol}: {qty} × ${price:,.2f} = **${value:,.2f}**")
-            except Exception:
-                rows.append(f"• {symbol}: ❌ Could not fetch price")
-        if not rows:
-            return "No valid holdings found. Format: 'AAPL:10,GOOGL:5'"
-        return (
-            f"💼 **Portfolio Summary**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            + "\n".join(rows)
-            + f"\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 **Total Value: ${total:,.2f}**"
+
+                positions.append({
+                    "symbol": symbol,
+                    "quantity": quantity,
+                    "price": price,
+                    "value": value,
+                })
+
+            except Exception as exc:
+
+                positions.append({
+                    "symbol": symbol,
+                    "error": str(exc)
+                })
+
+        # --------------------------------------------------------
+        # No successful positions
+        # --------------------------------------------------------
+
+        successful = [
+            position
+            for position in positions
+            if "value" in position
+        ]
+
+        if not successful:
+
+            return (
+                "❌ **No holdings could be valued.**\n\n"
+                "Check your ticker symbols and quantities.\n\n"
+                "Example:\n"
+                "`AAPL:10,MSFT:5,BTC-USD:0.5`"
+            )
+
+        # --------------------------------------------------------
+        # Build report
+        # --------------------------------------------------------
+
+        rows = []
+
+        for position in positions:
+
+            symbol = position["symbol"]
+
+            if "value" not in position:
+
+                rows.append(
+                    f"• **{symbol}**: ❌ "
+                    f"{position['error']}"
+                )
+
+                continue
+
+            quantity = position["quantity"]
+            price = position["price"]
+            value = position["value"]
+
+            rows.append(
+                f"• **{symbol}**: "
+                f"{quantity:g} × "
+                f"${price:,.2f} = "
+                f"**${value:,.2f}**"
+            )
+
+        successful_value = sum(
+            position["value"]
+            for position in successful
         )
-    except ImportError:
-        return "The 'yfinance' package is not installed. Run: pip install yfinance"
+
+        return (
+            "💼 **Portfolio Summary**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            + "\n".join(rows)
+            + "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 **Total Value: "
+            f"${successful_value:,.2f}**\n\n"
+            "_Prices are latest available market data "
+            "from Yahoo Finance via yfinance._"
+        )
+
+    except ImportError as exc:
+        return f"❌ {exc}"
+
     except Exception as exc:
-        return f"Portfolio error: {exc}"
+        return (
+            f"❌ **Portfolio calculation error**\n\n"
+            f"`{exc}`"
+        )
 
 
 # ============================================================
@@ -1167,449 +2725,1881 @@ def portfolio_calculator(holdings: str) -> str:
 @tool
 def read_csv(filepath: str, max_rows: int = 20) -> str:
     """
-    Read and preview a CSV file, showing its structure and first rows.
+    Read and analyze a CSV file.
+
+    Provides:
+    - File shape
+    - Column names
+    - Data types
+    - Missing-value counts
+    - Basic numeric statistics
+    - Preview of rows
+
     Args:
-        filepath: Path to the CSV file on disk.
-        max_rows: Number of rows to preview (default 20).
+        filepath: Path to the CSV file.
+        max_rows: Number of preview rows, between 1 and 100.
     """
     try:
         import pandas as pd
-        df = pd.read_csv(filepath)
-        shape = df.shape
-        dtypes = df.dtypes.to_string()
-        preview = df.head(max_rows).to_string(index=False)
-        nulls = df.isnull().sum()
-        null_cols = nulls[nulls > 0]
-        null_info = null_cols.to_string() if not null_cols.empty else "None"
-        return (
-            f"📊 **CSV File: {filepath}**\n"
-            f"Shape: {shape[0]} rows × {shape[1]} columns\n\n"
-            f"**Column Types:**\n{dtypes}\n\n"
-            f"**Missing Values:**\n{null_info}\n\n"
-            f"**Preview (first {min(max_rows, shape[0])} rows):**\n```\n{preview}\n```"
+
+        if not filepath or not filepath.strip():
+            return "❌ Please provide a CSV file path."
+
+        try:
+            max_rows = int(max_rows)
+        except (TypeError, ValueError):
+            return "❌ max_rows must be an integer."
+
+        max_rows = max(1, min(max_rows, 100))
+
+        if not os.path.isfile(filepath):
+            return f"❌ CSV file not found: `{filepath}`"
+
+        # Try common encodings for real-world CSV files.
+        df = None
+        last_error = None
+
+        for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+            try:
+                df = pd.read_csv(filepath, encoding=encoding)
+                break
+            except UnicodeDecodeError as exc:
+                last_error = exc
+
+        if df is None:
+            return (
+                "❌ Could not decode the CSV file.\n\n"
+                f"Last encoding error: `{last_error}`"
+            )
+
+        rows, columns = df.shape
+
+        # Column information
+        column_info = "\n".join(
+            f"• **{column}** → {dtype}"
+            for column, dtype in df.dtypes.items()
         )
+
+        # Missing values
+        missing = df.isna().sum()
+        missing = missing[missing > 0]
+
+        if missing.empty:
+            missing_info = "None"
+        else:
+            missing_info = "\n".join(
+                f"• **{column}**: {count:,}"
+                for column, count in missing.items()
+            )
+
+        # Numeric statistics
+        numeric_df = df.select_dtypes(include="number")
+
+        if not numeric_df.empty:
+            stats = numeric_df.describe().round(2).to_string()
+            statistics = f"```text\n{stats}\n```"
+        else:
+            statistics = "No numeric columns available."
+
+        # Preview
+        preview = df.head(max_rows).to_string(index=False)
+
+        return (
+            f"📊 **CSV Analysis: {os.path.basename(filepath)}**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• Rows:       {rows:,}\n"
+            f"• Columns:    {columns:,}\n"
+            f"• File Size:  "
+            f"{os.path.getsize(filepath) / 1024:.1f} KB\n\n"
+
+            f"**Column Types**\n"
+            f"{column_info}\n\n"
+
+            f"**Missing Values**\n"
+            f"{missing_info}\n\n"
+
+            f"**Numeric Statistics**\n"
+            f"{statistics}\n\n"
+
+            f"**Preview — first {min(max_rows, rows)} rows**\n"
+            f"```text\n{preview}\n```"
+        )
+
     except ImportError:
-        return "The 'pandas' package is not installed. Run: pip install pandas"
-    except FileNotFoundError:
-        return f"File not found: {filepath}"
+        return (
+            "❌ The 'pandas' package is not installed.\n"
+            "Run: `python -m pip install pandas`"
+        )
+
+    except pd.errors.EmptyDataError:
+        return "❌ The CSV file is empty."
+
+    except pd.errors.ParserError as exc:
+        return (
+            "❌ Could not parse the CSV file.\n\n"
+            f"Parser error: `{exc}`"
+        )
+
+    except PermissionError:
+        return f"❌ Permission denied when reading `{filepath}`."
+
     except Exception as exc:
-        return f"CSV read error: {exc}"
+        return (
+            f"❌ **CSV read error**\n\n"
+            f"`{type(exc).__name__}: {exc}`"
+        )
 
 
 @tool
 def extract_pdf_text(filepath: str, max_pages: int = 5) -> str:
     """
-    Extract and return text content from a PDF file.
+    Extract text from a PDF document.
+
     Args:
         filepath: Path to the PDF file.
-        max_pages: Maximum number of pages to extract (default 5).
+        max_pages: Maximum number of pages to extract.
+                    Between 1 and 20.
+
+    Returns:
+        Extracted text with page boundaries.
     """
     try:
         import pdfplumber
+
+        if not filepath or not filepath.strip():
+            return "❌ Please provide a PDF file path."
+
+        try:
+            max_pages = int(max_pages)
+        except (TypeError, ValueError):
+            return "❌ max_pages must be an integer."
+
+        max_pages = max(1, min(max_pages, 20))
+
+        if not os.path.isfile(filepath):
+            return f"❌ PDF file not found: `{filepath}`"
+
         with pdfplumber.open(filepath) as pdf:
+
             total_pages = len(pdf.pages)
+
+            if total_pages == 0:
+                return "❌ The PDF contains no pages."
+
             pages_to_read = min(max_pages, total_pages)
+
             text_parts = []
-            for i, page in enumerate(pdf.pages[:pages_to_read]):
-                text = page.extract_text() or ""
-                text_parts.append(f"--- Page {i+1} ---\n{text}")
+            empty_pages = []
+
+            for page_number in range(pages_to_read):
+                page = pdf.pages[page_number]
+
+                try:
+                    text = page.extract_text(
+                        x_tolerance=2,
+                        y_tolerance=3
+                    ) or ""
+                except Exception as page_error:
+                    text = ""
+                    empty_pages.append(
+                        f"Page {page_number + 1}: {page_error}"
+                    )
+
+                text = text.strip()
+
+                if not text:
+                    empty_pages.append(
+                        f"Page {page_number + 1}: no extractable text"
+                    )
+
+                text_parts.append(
+                    f"--- Page {page_number + 1} ---\n"
+                    f"{text if text else '[No extractable text]'}"
+                )
+
             full_text = "\n\n".join(text_parts)
-            if len(full_text) > 5000:
-                full_text = full_text[:5000] + "\n\n… [Truncated to 5000 chars]"
-        return (
-            f"📄 **PDF: {filepath}** ({total_pages} pages total)\n"
-            f"Showing {pages_to_read} page(s):\n\n{full_text}"
-        )
+
+            # Prevent enormous tool responses.
+            max_chars = 12000
+
+            truncated = False
+
+            if len(full_text) > max_chars:
+                full_text = (
+                    full_text[:max_chars]
+                    + "\n\n… [Output truncated]"
+                )
+                truncated = True
+
+            result = (
+                f"📄 **PDF: {os.path.basename(filepath)}**\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• Total pages:    {total_pages}\n"
+                f"• Pages read:     {pages_to_read}\n"
+                f"• File size:      "
+                f"{os.path.getsize(filepath) / 1024:.1f} KB\n\n"
+                f"{full_text}"
+            )
+
+            if total_pages > pages_to_read:
+                result += (
+                    f"\n\n⚠️ Only the first {pages_to_read} "
+                    f"of {total_pages} pages were extracted."
+                )
+
+            if empty_pages:
+                result += (
+                    "\n\n⚠️ **Extraction notes:**\n"
+                    + "\n".join(
+                        f"• {item}"
+                        for item in empty_pages[:10]
+                    )
+                )
+
+                result += (
+                    "\n\nThis may indicate a scanned/image-only "
+                    "PDF that requires OCR."
+                )
+
+            if truncated:
+                result += (
+                    "\n\n⚠️ The extracted text was truncated "
+                    "to keep the tool response manageable."
+                )
+
+            return result
+
     except ImportError:
-        return "The 'pdfplumber' package is not installed. Run: pip install pdfplumber"
-    except FileNotFoundError:
-        return f"File not found: {filepath}"
+        return (
+            "❌ The 'pdfplumber' package is not installed.\n"
+            "Run: `python -m pip install pdfplumber`"
+        )
+
+    except PermissionError:
+        return f"❌ Permission denied when reading `{filepath}`."
+
     except Exception as exc:
-        return f"PDF extract error: {exc}"
+        return (
+            f"❌ **PDF extraction error**\n\n"
+            f"`{type(exc).__name__}: {exc}`"
+        )
 
 
 @tool
 def read_docx(filepath: str) -> str:
     """
-    Read and extract text content from a Word (.docx) document.
+    Read text and tables from a Microsoft Word DOCX document.
+
     Args:
         filepath: Path to the .docx file.
+
+    Returns:
+        Document paragraphs, tables, and basic structure.
     """
     try:
         from docx import Document
+
+        if not filepath or not filepath.strip():
+            return "❌ Please provide a DOCX file path."
+
+        if not os.path.isfile(filepath):
+            return f"❌ Word document not found: `{filepath}`"
+
         doc = Document(filepath)
-        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-        text = "\n\n".join(paragraphs)
-        if len(text) > 5000:
-            text = text[:5000] + "\n\n… [Truncated to 5000 chars]"
+
+        sections = []
+
+        # ----------------------------------------------------
+        # Paragraphs
+        # ----------------------------------------------------
+        paragraphs = [
+            p.text.strip()
+            for p in doc.paragraphs
+            if p.text.strip()
+        ]
+
+        if paragraphs:
+            paragraph_text = "\n\n".join(paragraphs)
+
+            if len(paragraph_text) > 8000:
+                paragraph_text = (
+                    paragraph_text[:8000]
+                    + "\n\n… [Paragraph text truncated]"
+                )
+
+            sections.append(
+                f"**Document Text**\n\n{paragraph_text}"
+            )
+
+        # ----------------------------------------------------
+        # Tables
+        # ----------------------------------------------------
+        table_sections = []
+
+        for table_index, table in enumerate(doc.tables, start=1):
+
+            rows = []
+
+            for row in table.rows:
+                cells = [
+                    cell.text.replace("\n", " ").strip()
+                    for cell in row.cells
+                ]
+
+                rows.append(" | ".join(cells))
+
+            if rows:
+                table_sections.append(
+                    f"**Table {table_index}**\n"
+                    + "\n".join(rows)
+                )
+
+        if table_sections:
+            sections.append(
+                "**Tables**\n\n"
+                + "\n\n".join(table_sections)
+            )
+
+        # ----------------------------------------------------
+        # Final output
+        # ----------------------------------------------------
+        if not sections:
+            content = "[Document contains no readable text.]"
+        else:
+            content = "\n\n".join(sections)
+
+        max_chars = 12000
+
+        if len(content) > max_chars:
+            content = (
+                content[:max_chars]
+                + "\n\n… [Output truncated]"
+            )
+
         return (
-            f"📝 **Word Document: {filepath}**\n"
-            f"({len(paragraphs)} paragraphs)\n\n{text}"
+            f"📝 **Word Document: "
+            f"{os.path.basename(filepath)}**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• Paragraphs: {len(paragraphs)}\n"
+            f"• Tables:     {len(doc.tables)}\n"
+            f"• File Size:  "
+            f"{os.path.getsize(filepath) / 1024:.1f} KB\n\n"
+            f"{content}"
         )
+
     except ImportError:
-        return "The 'python-docx' package is not installed. Run: pip install python-docx"
-    except FileNotFoundError:
-        return f"File not found: {filepath}"
+        return (
+            "❌ The 'python-docx' package is not installed.\n"
+            "Run: `python -m pip install python-docx`"
+        )
+
+    except PermissionError:
+        return f"❌ Permission denied when reading `{filepath}`."
+
     except Exception as exc:
-        return f"DOCX read error: {exc}"
+        return (
+            f"❌ **DOCX read error**\n\n"
+            f"`{type(exc).__name__}: {exc}`"
+        )
 
 
 @tool
 def query_sql(database_path: str, sql_query: str) -> str:
     """
-    Execute a SQL SELECT query on a SQLite database file and return results.
-    Only SELECT queries are allowed for safety.
+    Execute a read-only SQL query against a SQLite database.
+
+    Only SELECT and WITH (CTE) queries are allowed.
+    INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, PRAGMA,
+    ATTACH, DETACH, and other modifying statements are rejected.
+
     Args:
-        database_path: Path to the SQLite .db file.
-        sql_query: A valid SQL SELECT query.
+        database_path: Path to the SQLite database.
+        sql_query: SQL SELECT/WITH query.
+
+    Returns:
+        Formatted query results.
     """
+    db_conn = None
+
     try:
-        if not sql_query.strip().upper().startswith("SELECT"):
-            return "❌ Only SELECT queries are allowed for safety."
-        db_conn = sqlite3.connect(database_path, check_same_thread=False)
+        if not database_path or not database_path.strip():
+            return "❌ Please provide a database path."
+
+        if not sql_query or not sql_query.strip():
+            return "❌ Please provide a SQL query."
+
+        if not os.path.isfile(database_path):
+            return f"❌ Database not found: `{database_path}`"
+
+        query = sql_query.strip()
+
+        # Remove trailing semicolon for easier validation.
+        normalized = query.rstrip(";").strip()
+
+        if not normalized:
+            return "❌ SQL query is empty."
+
+        # ----------------------------------------------------
+        # Safety validation
+        # ----------------------------------------------------
+
+        # Only one SQL statement is permitted.
+        statements = [
+            statement.strip()
+            for statement in normalized.split(";")
+            if statement.strip()
+        ]
+
+        if len(statements) != 1:
+            return (
+                "❌ Multiple SQL statements are not allowed.\n\n"
+                "Only one read-only query may be executed."
+            )
+
+        first_keyword = (
+            normalized.split(None, 1)[0].upper()
+            if normalized.split()
+            else ""
+        )
+
+        # SELECT and WITH are the only allowed entry points.
+        if first_keyword not in {"SELECT", "WITH"}:
+            return (
+                "❌ **Read-only SQL restriction**\n\n"
+                "Only `SELECT` and `WITH` queries are allowed."
+            )
+
+        # Block dangerous SQLite statements/keywords.
+        blocked_keywords = {
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "DROP",
+            "ALTER",
+            "CREATE",
+            "REPLACE",
+            "UPSERT",
+            "ATTACH",
+            "DETACH",
+            "VACUUM",
+            "REINDEX",
+            "PRAGMA",
+        }
+
+        import re
+
+        upper_query = normalized.upper()
+
+        for keyword in blocked_keywords:
+            if re.search(
+                rf"\b{re.escape(keyword)}\b",
+                upper_query
+            ):
+                return (
+                    f"❌ SQL statement contains blocked "
+                    f"operation: `{keyword}`\n\n"
+                    "This tool is read-only."
+                )
+
+        # ----------------------------------------------------
+        # Execute query
+        # ----------------------------------------------------
+
+        db_conn = sqlite3.connect(
+            database_path,
+            check_same_thread=False,
+            timeout=10
+        )
+
+        # Read-only SQLite connection where possible.
+        db_conn.execute("PRAGMA query_only = ON")
+
         cursor = db_conn.cursor()
-        cursor.execute(sql_query)
-        rows = cursor.fetchall()
-        columns = [d[0] for d in cursor.description] if cursor.description else []
-        db_conn.close()
+
+        cursor.execute(normalized)
+
+        rows = cursor.fetchmany(100)
+
+        columns = [
+            description[0]
+            for description in cursor.description
+        ] if cursor.description else []
+
+        # Check whether more rows exist.
+        more_rows = cursor.fetchone() is not None
+
         if not rows:
-            return "Query returned no results."
-        header = " | ".join(columns)
-        separator = "-" * len(header)
-        result_rows = [" | ".join(str(v) for v in row) for row in rows[:50]]
-        body = "\n".join(result_rows)
-        note = f"\n(Showing {len(rows)} rows)" if len(rows) <= 50 else f"\n(Showing first 50 of {len(rows)} rows)"
-        return f"🗄️ **SQL Query Result**\n```\n{header}\n{separator}\n{body}\n```{note}"
-    except FileNotFoundError:
-        return f"Database not found: {database_path}"
-    except sqlite3.Error as exc:
-        return f"SQL error: {exc}"
+            return (
+                "🗄️ **SQL Query Result**\n\n"
+                "Query executed successfully, but returned "
+                "no rows."
+            )
+
+        # ----------------------------------------------------
+        # Format table
+        # ----------------------------------------------------
+
+        def format_value(value):
+            if value is None:
+                return "NULL"
+
+            text = str(value)
+
+            # Prevent extremely large individual cells.
+            if len(text) > 200:
+                text = text[:200] + "…"
+
+            return text.replace("\n", " ")
+
+        formatted_rows = [
+            [format_value(value) for value in row]
+            for row in rows
+        ]
+
+        # Calculate column widths.
+        widths = []
+
+        for index, column in enumerate(columns):
+            column_width = len(str(column))
+
+            for row in formatted_rows:
+                if index < len(row):
+                    column_width = max(
+                        column_width,
+                        len(row[index])
+                    )
+
+            widths.append(min(column_width, 40))
+
+        header = " | ".join(
+            str(column)[:40].ljust(widths[index])
+            for index, column in enumerate(columns)
+        )
+
+        separator = "-+-".join(
+            "-" * width
+            for width in widths
+        )
+
+        body_rows = []
+
+        for row in formatted_rows:
+            body_rows.append(
+                " | ".join(
+                    row[index][:40].ljust(widths[index])
+                    for index in range(len(columns))
+                )
+            )
+
+        body = "\n".join(body_rows)
+
+        result = (
+            f"🗄️ **SQL Query Result**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Database: `{os.path.basename(database_path)}`\n\n"
+            f"```text\n"
+            f"{header}\n"
+            f"{separator}\n"
+            f"{body}\n"
+            f"```"
+        )
+
+        if more_rows:
+            result += (
+                "\n\n⚠️ Showing the first **100 rows**."
+            )
+        else:
+            result += (
+                f"\n\nShowing **{len(rows)} row(s)**."
+            )
+
+        return result
+
+    except sqlite3.OperationalError as exc:
+        return (
+            "❌ **SQL execution error**\n\n"
+            f"`{exc}`"
+        )
+
+    except sqlite3.DatabaseError as exc:
+        return (
+            "❌ **SQLite database error**\n\n"
+            f"`{exc}`"
+        )
+
+    except PermissionError:
+        return (
+            f"❌ Permission denied accessing "
+            f"`{database_path}`."
+        )
+
     except Exception as exc:
-        return f"Query error: {exc}"
+        return (
+            f"❌ **SQL query error**\n\n"
+            f"`{type(exc).__name__}: {exc}`"
+        )
+
+    finally:
+        if db_conn is not None:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
 
 
 # ============================================================
 # ── NEW: LOCATION & MAPS TOOLS ──────────────────────────────
 # ============================================================
 
+import ipaddress
+
+
 @tool
 def geocode_address(address: str) -> str:
     """
-    Geocode an address or place name to get latitude, longitude, and details.
-    Uses Open-Meteo Geocoding API — free, no key needed.
+    Convert an address, city, landmark, or place name into
+    geographic coordinates using the Open-Meteo Geocoding API.
+
     Args:
-        address: Any address, city name, or place (e.g. 'Eiffel Tower', 'Sydney, Australia').
+        address:
+            Address or place name, e.g.:
+            'Eiffel Tower'
+            'Sydney, Australia'
+            'Kathmandu, Nepal'
+
+    Returns:
+        Up to 3 matching locations with coordinates,
+        country, administrative region, timezone, and population.
     """
     try:
-        resp = requests.get(
+        if not isinstance(address, str):
+            return "❌ Address must be provided as text."
+
+        address = address.strip()
+
+        if not address:
+            return "❌ Please provide an address or place name."
+
+        if len(address) > 200:
+            return "❌ Address is too long. Please provide a shorter location."
+
+        response = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": address, "count": 3, "language": "en", "format": "json"},
-            timeout=10
+            params={
+                "name": address,
+                "count": 3,
+                "language": "en",
+                "format": "json",
+            },
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "LangGraph-Chatbot/1.0",
+            },
+            timeout=10,
         )
-        data = resp.json()
+
+        response.raise_for_status()
+
+        data = response.json()
+
         results = data.get("results", [])
+
         if not results:
-            return f"Could not geocode '{address}'. Try a more specific location."
-        output = [f"📍 Geocoding results for: *{address}*\n"]
-        for i, loc in enumerate(results[:3], 1):
-            output.append(
-                f"{i}. **{loc.get('name')}, {loc.get('country', '')}**\n"
-                f"   Latitude:  {loc.get('latitude')}\n"
-                f"   Longitude: {loc.get('longitude')}\n"
-                f"   Timezone:  {loc.get('timezone', 'N/A')}\n"
-                f"   Admin:     {loc.get('admin1', 'N/A')}"
+            return (
+                f"❌ Could not geocode **{address}**.\n\n"
+                "Try a more specific location, such as:\n"
+                "• `Kathmandu, Nepal`\n"
+                "• `Sydney, Australia`\n"
+                "• `Eiffel Tower, Paris`"
             )
-        return "\n\n".join(output)
+
+        output = [
+            f"📍 **Geocoding Results**",
+            f"Query: `{address}`",
+            "━━━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        for index, loc in enumerate(results[:3], start=1):
+
+            name = loc.get("name") or "Unknown"
+            country = loc.get("country") or "Unknown"
+            country_code = loc.get("country_code") or ""
+
+            admin1 = loc.get("admin1") or "N/A"
+            admin2 = loc.get("admin2") or "N/A"
+
+            latitude = loc.get("latitude")
+            longitude = loc.get("longitude")
+
+            timezone = loc.get("timezone") or "N/A"
+            population = loc.get("population")
+
+            population_text = (
+                f"{population:,.0f}"
+                if isinstance(population, (int, float))
+                else "N/A"
+            )
+
+            output.append(
+                f"\n**{index}. {name}, {country} "
+                f"({country_code})**\n"
+                f"• Latitude:    {latitude}\n"
+                f"• Longitude:   {longitude}\n"
+                f"• Region:      {admin1}\n"
+                f"• Subregion:   {admin2}\n"
+                f"• Timezone:    {timezone}\n"
+                f"• Population:  {population_text}"
+            )
+
+        output.append(
+            "\n\n_Source: Open-Meteo Geocoding API_"
+        )
+
+        return "\n".join(output)
+
+    except requests.exceptions.Timeout:
+        return (
+            "❌ **Geocoding request timed out.**\n\n"
+            "Please try again."
+        )
+
+    except requests.exceptions.ConnectionError:
+        return (
+            "❌ **Could not connect to the geocoding service.**\n\n"
+            "Check your internet connection and try again."
+        )
+
+    except requests.exceptions.HTTPError as exc:
+        status = (
+            exc.response.status_code
+            if exc.response is not None
+            else "unknown"
+        )
+
+        return (
+            f"❌ **Geocoding API error**\n\n"
+            f"HTTP status: `{status}`"
+        )
+
+    except ValueError:
+        return (
+            "❌ The geocoding service returned "
+            "invalid JSON data."
+        )
+
     except Exception as exc:
-        return f"Geocoding error: {exc}"
+        return (
+            f"❌ **Geocoding error**\n\n"
+            f"`{type(exc).__name__}: {exc}`"
+        )
 
 
 @tool
 def get_timezone(location: str) -> str:
     """
-    Get the timezone and current local time for any city or location.
+    Get the timezone and current local time for a city or location.
+
     Args:
-        location: City or place name (e.g. 'Tokyo', 'New York', 'Kathmandu').
+        location:
+            City or place name, e.g.:
+            'Tokyo'
+            'New York'
+            'Kathmandu, Nepal'
+
+    Returns:
+        Timezone, current local time, UTC offset, and coordinates.
     """
     try:
-        resp = requests.get(
+        if not isinstance(location, str):
+            return "❌ Location must be provided as text."
+
+        location = location.strip()
+
+        if not location:
+            return "❌ Please provide a city or location."
+
+        if len(location) > 200:
+            return "❌ Location name is too long."
+
+        response = requests.get(
             "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": location, "count": 1, "language": "en", "format": "json"},
-            timeout=10
+            params={
+                "name": location,
+                "count": 1,
+                "language": "en",
+                "format": "json",
+            },
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "LangGraph-Chatbot/1.0",
+            },
+            timeout=10,
         )
-        data = resp.json()
+
+        response.raise_for_status()
+
+        data = response.json()
+
         results = data.get("results", [])
+
         if not results:
-            return f"Could not find timezone for '{location}'."
+            return (
+                f"❌ Could not find **{location}**.\n\n"
+                "Try including the country, for example:\n"
+                "`Kathmandu, Nepal`"
+            )
+
         loc = results[0]
-        tz_name = loc.get("timezone", "UTC")
+
+        name = loc.get("name") or location
+        country = loc.get("country") or "Unknown"
+        country_code = loc.get("country_code") or ""
+
+        timezone_name = loc.get("timezone")
+
+        latitude = loc.get("latitude")
+        longitude = loc.get("longitude")
+
+        if not timezone_name:
+            return (
+                f"❌ No timezone information was returned "
+                f"for **{name}**."
+            )
+
         try:
-            tz = ZoneInfo(tz_name)
-            local_time = datetime.now(tz).strftime("%A, %B %d, %Y — %I:%M:%S %p")
-        except Exception:
-            local_time = "Could not compute local time"
+            tz = ZoneInfo(timezone_name)
+
+            now = datetime.now(tz)
+
+            local_time = now.strftime(
+                "%A, %B %d, %Y — %I:%M:%S %p"
+            )
+
+            utc_offset = now.strftime("%z")
+
+            if len(utc_offset) == 5:
+                utc_offset = (
+                    utc_offset[:3]
+                    + ":"
+                    + utc_offset[3:]
+                )
+
+            iso_time = now.isoformat()
+
+        except Exception as exc:
+            return (
+                f"❌ Could not calculate local time for "
+                f"timezone `{timezone_name}`.\n\n"
+                f"`{exc}`"
+            )
+
         return (
-            f"🕐 **Timezone for {loc.get('name')}, {loc.get('country', '')}**\n"
+            f"🕐 **Local Time — {name}, {country} "
+            f"({country_code})**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• Timezone:    {tz_name}\n"
+            f"• Timezone:    `{timezone_name}`\n"
             f"• Local Time:  {local_time}\n"
-            f"• Coordinates: {loc.get('latitude')}, {loc.get('longitude')}"
+            f"• UTC Offset:  UTC{utc_offset}\n"
+            f"• Coordinates: {latitude}, {longitude}\n"
+            f"• ISO Time:    `{iso_time}`\n\n"
+            f"_Source: Open-Meteo Geocoding API + Python ZoneInfo_"
         )
+
+    except requests.exceptions.Timeout:
+        return (
+            "❌ **Timezone lookup timed out.**\n\n"
+            "Please try again."
+        )
+
+    except requests.exceptions.ConnectionError:
+        return (
+            "❌ **Could not connect to the geocoding service.**\n\n"
+            "Check your internet connection and try again."
+        )
+
+    except requests.exceptions.HTTPError as exc:
+        status = (
+            exc.response.status_code
+            if exc.response is not None
+            else "unknown"
+        )
+
+        return (
+            f"❌ **Timezone API error**\n\n"
+            f"HTTP status: `{status}`"
+        )
+
+    except ValueError:
+        return (
+            "❌ The geocoding service returned "
+            "invalid JSON data."
+        )
+
     except Exception as exc:
-        return f"Timezone lookup error: {exc}"
+        return (
+            f"❌ **Timezone lookup error**\n\n"
+            f"`{type(exc).__name__}: {exc}`"
+        )
 
 
 @tool
 def ip_geolocation(ip_address: str = "") -> str:
     """
-    Get geolocation information for an IP address.
-    Leave ip_address blank to geolocate the current machine's public IP.
+    Get approximate geographic information for an IP address.
+
+    If ip_address is blank, the public IP of the machine running
+    the chatbot is used.
+
     Args:
-        ip_address: IPv4 or IPv6 address (optional — defaults to current public IP).
+        ip_address:
+            IPv4 or IPv6 address.
+            Leave blank to detect the current public IP.
+
+    Returns:
+        Country, region, city, coordinates, timezone, ISP,
+        organization, and approximate location information.
     """
     try:
-        target = ip_address.strip() if ip_address.strip() else ""
-        url = f"http://ip-api.com/json/{target}" if target else "http://ip-api.com/json/"
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        if data.get("status") == "fail":
-            return f"Failed to geolocate IP '{ip_address}': {data.get('message')}"
-        return (
-            f"🌐 **IP Geolocation: {data.get('query')}**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• Country:   {data.get('country')} ({data.get('countryCode')})\n"
-            f"• Region:    {data.get('regionName')}\n"
-            f"• City:      {data.get('city')}\n"
-            f"• ZIP:       {data.get('zip', 'N/A')}\n"
-            f"• Latitude:  {data.get('lat')}\n"
-            f"• Longitude: {data.get('lon')}\n"
-            f"• Timezone:  {data.get('timezone')}\n"
-            f"• ISP:       {data.get('isp')}"
+        if not isinstance(ip_address, str):
+            return "❌ IP address must be provided as text."
+
+        target = ip_address.strip()
+
+        # ----------------------------------------------------
+        # Validate explicit IP addresses
+        # ----------------------------------------------------
+
+        if target:
+
+            try:
+                ipaddress.ip_address(target)
+
+            except ValueError:
+                return (
+                    f"❌ Invalid IP address: `{target}`\n\n"
+                    "Provide a valid IPv4 or IPv6 address."
+                )
+
+        # HTTPS instead of HTTP.
+        if target:
+            url = (
+                f"https://ip-api.com/json/"
+                f"{target}"
+            )
+        else:
+            url = "https://ip-api.com/json/"
+
+        response = requests.get(
+            url,
+            params={
+                "fields": (
+                    "status,message,query,country,countryCode,"
+                    "region,regionName,city,zip,lat,lon,timezone,"
+                    "isp,org,as,asname"
+                )
+            },
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "LangGraph-Chatbot/1.0",
+            },
+            timeout=10,
         )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if data.get("status") != "success":
+            message = data.get(
+                "message",
+                "Unknown geolocation error."
+            )
+
+            return (
+                "❌ **IP geolocation failed**\n\n"
+                f"Reason: `{message}`"
+            )
+
+        query_ip = data.get("query") or target or "Unknown"
+
+        country = data.get("country") or "N/A"
+        country_code = data.get("countryCode") or "N/A"
+
+        region = data.get("regionName") or "N/A"
+        city = data.get("city") or "N/A"
+        postal_code = data.get("zip") or "N/A"
+
+        latitude = data.get("lat")
+        longitude = data.get("lon")
+
+        timezone_name = data.get("timezone") or "N/A"
+
+        isp = data.get("isp") or "N/A"
+        organization = data.get("org") or "N/A"
+
+        as_number = data.get("as") or "N/A"
+        as_name = data.get("asname") or "N/A"
+
+        return (
+            f"🌐 **IP Geolocation**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• IP Address:   `{query_ip}`\n"
+            f"• Country:      {country} ({country_code})\n"
+            f"• Region:       {region}\n"
+            f"• City:         {city}\n"
+            f"• Postal Code:  {postal_code}\n"
+            f"• Latitude:     {latitude}\n"
+            f"• Longitude:    {longitude}\n"
+            f"• Timezone:     {timezone_name}\n"
+            f"• ISP:          {isp}\n"
+            f"• Organization: {organization}\n"
+            f"• ASN:          {as_number}\n"
+            f"• AS Name:      {as_name}\n\n"
+            f"⚠️ IP geolocation is approximate and "
+            f"should not be treated as an exact physical address.\n\n"
+            f"_Source: ip-api.com_"
+        )
+
+    except requests.exceptions.Timeout:
+        return (
+            "❌ **IP geolocation request timed out.**\n\n"
+            "Please try again."
+        )
+
+    except requests.exceptions.ConnectionError:
+        return (
+            "❌ **Could not connect to the IP geolocation service.**\n\n"
+            "Check your internet connection and try again."
+        )
+
+    except requests.exceptions.HTTPError as exc:
+        status = (
+            exc.response.status_code
+            if exc.response is not None
+            else "unknown"
+        )
+
+        return (
+            f"❌ **IP geolocation API error**\n\n"
+            f"HTTP status: `{status}`"
+        )
+
+    except ValueError:
+        return (
+            "❌ The IP geolocation service returned "
+            "invalid JSON data."
+        )
+
     except Exception as exc:
-        return f"IP geolocation error: {exc}"
+        return (
+            f"❌ **IP geolocation error**\n\n"
+            f"`{type(exc).__name__}: {exc}`"
+        )
 
 
 # ============================================================
-# ── NEW: AI MEMORY TOOLS ────────────────────────────────────
+# ── AI MEMORY TOOLS ─────────────────────────────────────────
 # ============================================================
+
+def _clean_memory_key(key: str) -> str:
+    """Normalize and validate a memory key."""
+    if not isinstance(key, str):
+        raise ValueError("Memory key must be a string.")
+
+    key = key.strip().lower()
+
+    if not key:
+        raise ValueError("Memory key cannot be empty.")
+
+    if len(key) > 100:
+        raise ValueError("Memory key must be 100 characters or fewer.")
+
+    return key
+
+
+def _clean_memory_value(value: str) -> str:
+    """Validate and normalize a memory value."""
+    if not isinstance(value, str):
+        raise ValueError("Memory value must be a string.")
+
+    value = value.strip()
+
+    if not value:
+        raise ValueError("Memory value cannot be empty.")
+
+    if len(value) > 2000:
+        raise ValueError("Memory value must be 2,000 characters or fewer.")
+
+    return value
+
 
 @tool
 def remember_fact(key: str, value: str) -> str:
     """
-    Store a fact or piece of information in persistent memory so it can be recalled later.
-    Use this when the user tells you something they want you to remember across conversations.
+    Store or update a fact in persistent SQLite memory.
+
+    Use this when the user explicitly asks the assistant to remember
+    something for future conversations.
+
     Args:
-        key: A short descriptive label (e.g. 'user_name', 'favorite_color', 'project_goal').
-        value: The information to store.
+        key: Short descriptive label such as 'user_name',
+             'favorite_color', or 'project_goal'.
+        value: Information to store.
     """
     try:
+        key = _clean_memory_key(key)
+        value = _clean_memory_value(value)
+
         cursor = conn.cursor()
-        # Upsert: delete old value for key, then insert new one
-        cursor.execute("DELETE FROM memories WHERE key = ?", (key,))
-        cursor.execute("INSERT INTO memories (key, value) VALUES (?, ?)", (key, value))
+
+        # Check whether the memory already exists.
+        cursor.execute(
+            "SELECT value FROM memories WHERE key = ?",
+            (key,)
+        )
+        existing = cursor.fetchone()
+
+        if existing:
+            cursor.execute(
+                """
+                UPDATE memories
+                SET value = ?, created_at = CURRENT_TIMESTAMP
+                WHERE key = ?
+                """,
+                (value, key)
+            )
+            action = "Updated"
+        else:
+            cursor.execute(
+                """
+                INSERT INTO memories (key, value)
+                VALUES (?, ?)
+                """,
+                (key, value)
+            )
+            action = "Remembered"
+
         conn.commit()
-        return f"✅ Remembered: **{key}** → \"{value}\""
-    except Exception as exc:
-        return f"Memory store error: {exc}"
+
+        return f'🧠 **{action}:** `{key}` → "{value}"'
+
+    except ValueError as exc:
+        return f"⚠️ Invalid memory: {exc}"
+
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+        return "❌ Memory store error. The memory could not be saved."
 
 
 @tool
-def recall_memories(query: str = "") -> str:
+def recall_memories(
+    query: str = "",
+    max_results: int = 20
+) -> str:
     """
-    Recall stored memories. Optionally filter by a keyword.
+    Recall stored memories.
+
+    Optionally filter memories by keyword in either the key or value.
+
     Args:
-        query: Optional keyword to filter memories (leave blank to retrieve all).
+        query: Optional keyword or phrase to search for.
+        max_results: Maximum number of memories to return (1-50).
     """
     try:
+        if not isinstance(query, str):
+            return "⚠️ Memory search query must be text."
+
+        query = query.strip()
+
+        if not isinstance(max_results, int):
+            return "⚠️ max_results must be an integer."
+
+        max_results = max(1, min(max_results, 50))
+
         cursor = conn.cursor()
-        if query.strip():
+
+        if query:
+            search_pattern = f"%{query}%"
+
             cursor.execute(
-                "SELECT key, value, created_at FROM memories WHERE key LIKE ? OR value LIKE ? ORDER BY created_at DESC",
-                (f"%{query}%", f"%{query}%")
+                """
+                SELECT key, value, created_at
+                FROM memories
+                WHERE key LIKE ? OR value LIKE ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (search_pattern, search_pattern, max_results)
             )
         else:
-            cursor.execute("SELECT key, value, created_at FROM memories ORDER BY created_at DESC")
+            cursor.execute(
+                """
+                SELECT key, value, created_at
+                FROM memories
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (max_results,)
+            )
+
         rows = cursor.fetchall()
+
         if not rows:
-            return "🧠 No memories stored yet." if not query else f"No memories found matching '{query}'."
-        lines = [f"🧠 **Stored Memories** ({len(rows)} total):\n"]
+            if query:
+                return f"🧠 No memories found matching '{query}'."
+            return "🧠 No memories stored yet."
+
+        lines = [
+            f"🧠 **Stored Memories** ({len(rows)} shown):"
+        ]
+
         for key, value, created_at in rows:
-            lines.append(f"• **{key}**: {value}  *(saved {created_at[:10]})*")
+            saved_date = str(created_at)[:10] if created_at else "unknown"
+
+            lines.append(
+                f"• **{key}**: {value} "
+                f"*(saved {saved_date})*"
+            )
+
         return "\n".join(lines)
-    except Exception as exc:
-        return f"Memory recall error: {exc}"
+
+    except Exception:
+        return "❌ Memory recall error. The memories could not be retrieved."
 
 
 @tool
 def forget_memory(key: str) -> str:
     """
     Delete a specific stored memory by its key.
+
+    Use this when the user explicitly asks the assistant to forget
+    or delete a particular remembered fact.
+
     Args:
         key: The key of the memory to delete.
     """
     try:
+        key = _clean_memory_key(key)
+
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM memories WHERE key = ?", (key,))
+
+        cursor.execute(
+            "DELETE FROM memories WHERE key = ?",
+            (key,)
+        )
+
+        deleted = cursor.rowcount
+
         conn.commit()
-        if cursor.rowcount > 0:
-            return f"🗑️ Deleted memory: **{key}**"
-        return f"No memory found with key '{key}'."
-    except Exception as exc:
-        return f"Memory delete error: {exc}"
+
+        if deleted:
+            return f"🗑️ **Forgotten:** `{key}`"
+
+        return f"🧠 No memory found with key `{key}`."
+
+    except ValueError as exc:
+        return f"⚠️ Invalid memory key: {exc}"
+
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+        return "❌ Memory delete error. The memory could not be deleted."
 
 
 @tool
-def search_past_conversations(keyword: str, max_results: int = 5) -> str:
+def search_past_conversations(
+    keyword: str,
+    max_results: int = 5
+) -> str:
     """
-    Search through past conversation titles for a keyword.
+    Search past conversation titles for a keyword.
+
+    This searches conversation metadata/titles, not the full
+    conversation message contents.
+
     Args:
         keyword: Word or phrase to search for in conversation titles.
-        max_results: Maximum number of results to return (default 5).
+        max_results: Maximum number of results to return (1-20).
     """
     try:
+        if not isinstance(keyword, str):
+            return "⚠️ Search keyword must be text."
+
+        keyword = keyword.strip()
+
+        if not keyword:
+            return "⚠️ Please provide a keyword to search for."
+
+        if len(keyword) > 200:
+            return "⚠️ Search keyword must be 200 characters or fewer."
+
+        if not isinstance(max_results, int):
+            return "⚠️ max_results must be an integer."
+
+        max_results = max(1, min(max_results, 20))
+
         cursor = conn.cursor()
+
         cursor.execute(
-            "SELECT thread_id, title, updated_at FROM conversations WHERE title LIKE ? ORDER BY updated_at DESC LIMIT ?",
+            """
+            SELECT thread_id, title, updated_at
+            FROM conversations
+            WHERE title LIKE ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
             (f"%{keyword}%", max_results)
         )
+
         rows = cursor.fetchall()
+
         if not rows:
-            return f"No past conversations found matching '{keyword}'."
-        lines = [f"🔍 **Conversations matching '{keyword}':**\n"]
+            return (
+                f"🔍 No past conversations found "
+                f"with '{keyword}' in the title."
+            )
+
+        lines = [
+            f"🔍 **Past Conversations matching '{keyword}'** "
+            f"({len(rows)} found):"
+        ]
+
         for thread_id, title, updated_at in rows:
-            lines.append(f"• **{title}** (last active: {updated_at[:10]})")
+            title = title or "(Untitled)"
+            date = str(updated_at)[:10] if updated_at else "unknown"
+
+            lines.append(
+                f"• **{title}** — last active {date}"
+            )
+
         return "\n".join(lines)
-    except Exception as exc:
-        return f"Search error: {exc}"
+
+    except Exception:
+        return "❌ Conversation search error. Past conversations could not be searched."
+
+
 
 
 # ============================================================
-# ── NEW: IMAGE TOOLS ────────────────────────────────────────
+# ── IMAGE TOOLS ─────────────────────────────────────────────
 # ============================================================
 
 @tool
-def resize_image(filepath: str, width: int, height: int, output_path: str = "") -> str:
+def resize_image(
+    filepath: str,
+    width: int,
+    height: int,
+    output_path: str = ""
+) -> str:
     """
-    Resize an image file to the specified dimensions.
+    Resize an image to exact pixel dimensions.
+
+    Supports common formats such as JPG, JPEG, PNG, WEBP, BMP,
+    GIF, and TIFF when supported by Pillow.
+
     Args:
-        filepath: Path to the source image (JPG, PNG, BMP, etc.).
-        width: Target width in pixels.
-        height: Target height in pixels.
-        output_path: Where to save the resized image (optional — defaults to same dir with '_resized' suffix).
+        filepath: Path to the source image.
+        width: Target width in pixels (1-8000).
+        height: Target height in pixels (1-8000).
+        output_path: Optional destination path. If omitted,
+                     creates '<name>_resized<extension>'.
     """
     try:
-        from PIL import Image
-        img = Image.open(filepath)
-        original_size = img.size
-        img_resized = img.resize((width, height), Image.LANCZOS)
+        from PIL import Image, UnidentifiedImageError
+
+        # -----------------------------
+        # Validate input
+        # -----------------------------
+        if not isinstance(filepath, str) or not filepath.strip():
+            return "⚠️ Image filepath cannot be empty."
+
+        filepath = filepath.strip()
+
+        if not os.path.isfile(filepath):
+            return f"❌ Image file not found: {filepath}"
+
+        if not isinstance(width, int) or not isinstance(height, int):
+            return "⚠️ Width and height must be integers."
+
+        if width < 1 or height < 1:
+            return "⚠️ Width and height must be greater than 0."
+
+        if width > 8000 or height > 8000:
+            return "⚠️ Maximum supported dimension is 8000×8000 pixels."
+
+        # Prevent accidentally creating enormous images.
+        if width * height > 64_000_000:
+            return "⚠️ Target image is too large. Maximum area is 64 million pixels."
+
+        # -----------------------------
+        # Determine output path
+        # -----------------------------
+        if output_path:
+            output_path = output_path.strip()
+
+            if not output_path:
+                output_path = ""
+
         if not output_path:
             base, ext = os.path.splitext(filepath)
             output_path = f"{base}_resized{ext}"
-        img_resized.save(output_path)
+
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+
+        if not os.path.isdir(output_dir):
+            return f"❌ Output directory does not exist: {output_dir}"
+
+        # Avoid overwriting the original image.
+        if os.path.abspath(filepath) == os.path.abspath(output_path):
+            return "⚠️ Output path must be different from the source image."
+
+        # -----------------------------
+        # Open and validate image
+        # -----------------------------
+        try:
+            with Image.open(filepath) as img:
+                img.verify()
+
+            # Re-open after verify(); verify() invalidates the image object.
+            with Image.open(filepath) as img:
+                original_size = img.size
+                original_format = img.format
+                original_mode = img.mode
+
+                # Load image data before closing.
+                img.load()
+
+                resized = img.resize(
+                    (width, height),
+                    Image.Resampling.LANCZOS
+                )
+
+                # -----------------------------
+                # Preserve format compatibility
+                # -----------------------------
+                save_kwargs = {}
+
+                output_ext = os.path.splitext(output_path)[1].lower()
+
+                # JPEG does not support RGBA/P modes.
+                if output_ext in {".jpg", ".jpeg"}:
+                    if resized.mode in {"RGBA", "LA", "P"}:
+                        # Preserve transparency as much as possible by
+                        # compositing onto white for JPEG output.
+                        if resized.mode in {"RGBA", "LA"}:
+                            background = Image.new("RGB", resized.size, "white")
+                            if resized.mode == "RGBA":
+                                background.paste(
+                                    resized,
+                                    mask=resized.getchannel("A")
+                                )
+                            else:
+                                background.paste(
+                                    resized,
+                                    mask=resized.getchannel("A")
+                                )
+                            resized = background
+                        else:
+                            resized = resized.convert("RGB")
+
+                    save_kwargs["quality"] = 95
+                    save_kwargs["optimize"] = True
+
+                elif output_ext == ".png":
+                    save_kwargs["optimize"] = True
+
+                elif output_ext == ".webp":
+                    save_kwargs["quality"] = 95
+                    save_kwargs["method"] = 6
+
+                # Save.
+                resized.save(output_path, **save_kwargs)
+
+                new_file_size = os.path.getsize(output_path)
+
+        except UnidentifiedImageError:
+            return (
+                "❌ The file is not a valid or supported image. "
+                "It may be corrupted or use an unsupported format."
+            )
+
+        except OSError as exc:
+            return f"❌ Could not process image: {exc}"
+
         return (
-            f"✅ Image resized successfully!\n"
-            f"• Original size: {original_size[0]}×{original_size[1]} px\n"
-            f"• New size:      {width}×{height} px\n"
-            f"• Saved to:      {output_path}"
+            "✅ **Image resized successfully**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• Original:    {original_size[0]}×{original_size[1]} px\n"
+            f"• New size:    {width}×{height} px\n"
+            f"• Format:      {original_format or 'Unknown'}\n"
+            f"• Mode:        {original_mode}\n"
+            f"• Output:      {output_path}\n"
+            f"• Output size: {new_file_size / 1024:.1f} KB"
         )
+
     except ImportError:
-        return "The 'Pillow' package is not installed. Run: pip install Pillow"
-    except FileNotFoundError:
-        return f"Image file not found: {filepath}"
-    except Exception as exc:
-        return f"Image resize error: {exc}"
+        return (
+            "❌ Pillow is not installed.\n"
+            "Run: python -m pip install Pillow"
+        )
+
+    except Exception:
+        return (
+            "❌ Image resize error. "
+            "The image could not be resized."
+        )
 
 
 @tool
 def get_image_info(filepath: str) -> str:
     """
-    Get metadata and information about an image file (dimensions, format, mode, file size).
+    Get detailed metadata and technical information about an image.
+
     Args:
         filepath: Path to the image file.
     """
     try:
-        from PIL import Image
-        img = Image.open(filepath)
+        from PIL import Image, UnidentifiedImageError
+
+        # -----------------------------
+        # Validate input
+        # -----------------------------
+        if not isinstance(filepath, str) or not filepath.strip():
+            return "⚠️ Image filepath cannot be empty."
+
+        filepath = filepath.strip()
+
+        if not os.path.isfile(filepath):
+            return f"❌ Image file not found: {filepath}"
+
         file_size = os.path.getsize(filepath)
+
+        if file_size == 0:
+            return "❌ Image file is empty."
+
+        # -----------------------------
+        # Open and validate image
+        # -----------------------------
+        try:
+            with Image.open(filepath) as img:
+                # Force Pillow to read image data so corrupted files
+                # are detected rather than just reading headers.
+                img.load()
+
+                filename = os.path.basename(filepath)
+                format_name = img.format or "Unknown"
+                mode = img.mode
+                width, height = img.size
+
+                # Number of channels where meaningful.
+                channels = {
+                    "1": 1,
+                    "L": 1,
+                    "LA": 2,
+                    "RGB": 3,
+                    "RGBA": 4,
+                    "CMYK": 4,
+                    "YCbCr": 3,
+                    "P": 1,
+                    "I": 1,
+                    "F": 1,
+                }.get(mode, "Unknown")
+
+                megapixels = (width * height) / 1_000_000
+
+                has_alpha = "A" in img.getbands()
+
+                # EXIF information count only; do not dump potentially
+                # sensitive metadata into the response.
+                try:
+                    exif = img.getexif()
+                    exif_count = len(exif) if exif else 0
+                except Exception:
+                    exif_count = 0
+
+        except UnidentifiedImageError:
+            return (
+                "❌ The file is not a valid or supported image. "
+                "It may be corrupted or unsupported."
+            )
+
+        except OSError as exc:
+            return f"❌ Could not read image: {exc}"
+
+        # -----------------------------
+        # Human-readable result
+        # -----------------------------
         return (
-            f"🖼️ **Image Info: {os.path.basename(filepath)}**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• Format:     {img.format}\n"
-            f"• Mode:       {img.mode}\n"
-            f"• Dimensions: {img.size[0]}×{img.size[1]} px\n"
-            f"• File Size:  {file_size / 1024:.1f} KB\n"
-            f"• File Path:  {filepath}"
+            f"🖼️ **Image Information: {filename}**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• Format:       {format_name}\n"
+            f"• Mode:         {mode}\n"
+            f"• Dimensions:   {width}×{height} px\n"
+            f"• Megapixels:   {megapixels:.2f} MP\n"
+            f"• Channels:     {channels}\n"
+            f"• Transparency: {'Yes' if has_alpha else 'No'}\n"
+            f"• File size:    {file_size / 1024:.1f} KB\n"
+            f"• EXIF fields:  {exif_count}\n"
+            f"• File path:    {filepath}"
         )
+
     except ImportError:
-        return "The 'Pillow' package is not installed. Run: pip install Pillow"
-    except FileNotFoundError:
-        return f"Image file not found: {filepath}"
-    except Exception as exc:
-        return f"Image info error: {exc}"
+        return (
+            "❌ Pillow is not installed.\n"
+            "Run: python -m pip install Pillow"
+        )
+
+    except Exception:
+        return (
+            "❌ Image info error. "
+            "The image metadata could not be read."
+        )
+
 
 
 # ============================================================
-# ── RAG TOOL ────────────────────────────────────────────────
+# ── RAG / PDF QUERY TOOL ───────────────────────────────────
 # ============================================================
+
+from langchain_core.runnables import RunnableConfig
+
 
 @tool
-def query_pdf(question: str, thread_id: str, top_k: int = 7) -> str:
+def query_pdf(
+    question: str,
+    thread_id: str = "",
+    top_k: int = 7,
+    config: RunnableConfig = None,
+) -> str:
     """
-    Answer a question using the PDF documents the user has uploaded in this conversation.
-    Uses semantic search with Maximal Marginal Relevance (MMR) to retrieve the most
-    relevant AND diverse chunks from the uploaded PDF(s), then returns them as context.
+    Retrieve relevant content from PDFs uploaded in the current conversation.
 
-    IMPORTANT: Only call this tool when the user explicitly mentions the PDF, uploaded
-    document, or asks something like 'from the PDF', 'based on the document', 'according
-    to the file', 'from my notes', 'using the uploaded file', etc.
-    Do NOT call this for general questions — use other tools or your own knowledge instead.
+    Uses the conversation's thread_id to access the correct PDF index and
+    Maximal Marginal Relevance (MMR) retrieval to return relevant and
+    diverse document chunks.
+
+    IMPORTANT:
+    Only use this tool when the user explicitly asks about an uploaded PDF,
+    document, notes, or file.
+
+    Do NOT use this tool for general knowledge questions.
 
     Args:
-        question: The user's question to answer from the PDF content.
-        thread_id: The current conversation thread ID (passed automatically by the agent).
-        top_k: Number of document chunks to retrieve (5–10; default 7).
+        question: Question to answer using the uploaded PDF.
+        thread_id: Current conversation thread ID. Usually obtained
+                   automatically from RunnableConfig.
+        top_k: Number of chunks to retrieve (5-10, default 7).
+        config: LangGraph runtime configuration containing thread_id.
     """
+
+    # --------------------------------------------------------
+    # Resolve thread_id from LangGraph runtime configuration
+    # --------------------------------------------------------
+    try:
+        configurable = (config or {}).get("configurable", {})
+
+        runtime_thread_id = configurable.get("thread_id")
+
+        if runtime_thread_id:
+            thread_id = runtime_thread_id
+
+    except Exception:
+        pass
+
+    # --------------------------------------------------------
+    # Validate question
+    # --------------------------------------------------------
+    if not isinstance(question, str):
+        return "⚠️ PDF question must be text."
+
+    question = question.strip()
+
+    if not question:
+        return "⚠️ Please provide a question about the uploaded PDF."
+
+    if len(question) > 2000:
+        return "⚠️ PDF question is too long. Please keep it under 2,000 characters."
+
+    # --------------------------------------------------------
+    # Validate thread ID
+    # --------------------------------------------------------
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return (
+            "⚠️ No conversation thread ID was available. "
+            "The PDF index cannot be identified."
+        )
+
+    thread_id = thread_id.strip()
+
+    # Prevent accidentally passing an enormous identifier.
+    if len(thread_id) > 200:
+        return "⚠️ Invalid conversation thread ID."
+
+    # --------------------------------------------------------
+    # Validate top_k
+    # --------------------------------------------------------
+    if isinstance(top_k, bool) or not isinstance(top_k, int):
+        return "⚠️ top_k must be an integer."
+
     top_k = max(5, min(top_k, 10))
-    retriever = get_rag_retriever(thread_id, k=top_k)
+
+    # --------------------------------------------------------
+    # Get conversation-specific retriever
+    # --------------------------------------------------------
+    try:
+        retriever = get_rag_retriever(
+            thread_id,
+            k=top_k
+        )
+
+    except Exception:
+        return (
+            "❌ The PDF search index could not be loaded. "
+            "Please try again or re-upload the PDF."
+        )
 
     if retriever is None:
         return (
-            "📄 **No PDF indexed for this conversation.**\n"
-            "Please upload a PDF using the '📄 Upload PDF' panel in the sidebar first, "
+            "📄 **No PDF indexed for this conversation.**\n\n"
+            "Please upload a PDF using the "
+            "'📄 Upload PDF' panel in the sidebar first, "
             "then ask your question again."
         )
 
+    # --------------------------------------------------------
+    # Retrieve relevant chunks
+    # --------------------------------------------------------
     try:
         docs = retriever.invoke(question)
-    except Exception as exc:
-        return f"RAG retrieval error: {exc}"
+
+    except Exception:
+        return (
+            "❌ PDF retrieval failed while searching the document. "
+            "Please try rephrasing your question."
+        )
 
     if not docs:
         return (
-            "🔍 No relevant content found in the uploaded PDF for your question.\n"
-            "Try rephrasing or asking about a different topic covered in the document."
+            "🔍 **No relevant content found.**\n\n"
+            "The uploaded PDF does not appear to contain enough "
+            "relevant text for this question.\n\n"
+            "Try rephrasing the question or asking about a topic "
+            "that is explicitly covered in the document."
         )
 
+    # --------------------------------------------------------
     # Format retrieved chunks
+    # --------------------------------------------------------
     parts = []
+    total_chars = 0
+
+    # Keep the context reasonably bounded so that a large PDF
+    # retrieval does not overwhelm the model.
+    MAX_CONTEXT_CHARS = 30_000
+    MAX_CHUNK_CHARS = 6_000
+
     for i, doc in enumerate(docs, 1):
-        meta = doc.metadata
-        page = meta.get("page", meta.get("page_number", "?"))
-        source = meta.get("source", "")
-        filename = os.path.basename(source) if source else "uploaded PDF"
-        parts.append(
-            f"【Chunk {i} · {filename} · Page {page}】\n{doc.page_content.strip()}"
+
+        if not doc or not getattr(doc, "page_content", None):
+            continue
+
+        content = doc.page_content.strip()
+
+        if not content:
+            continue
+
+        # Prevent one enormous chunk from dominating context.
+        if len(content) > MAX_CHUNK_CHARS:
+            content = content[:MAX_CHUNK_CHARS].rstrip() + "\n[…chunk truncated…]"
+
+        metadata = getattr(doc, "metadata", {}) or {}
+
+        # Different PDF loaders use different metadata names.
+        page = (
+            metadata.get("page")
+            or metadata.get("page_number")
+            or metadata.get("page_num")
+            or "?"
         )
 
+        # Most PDF libraries use zero-based page indexes.
+        # Keep the original value rather than silently changing it.
+        source = (
+            metadata.get("source")
+            or metadata.get("file_path")
+            or metadata.get("filename")
+            or ""
+        )
+
+        if source:
+            filename = os.path.basename(str(source))
+        else:
+            filename = "uploaded PDF"
+
+        # Some vector stores attach chunk IDs.
+        chunk_id = (
+            metadata.get("chunk_id")
+            or metadata.get("id")
+            or ""
+        )
+
+        header = f"【Chunk {i} · {filename} · Page {page}"
+
+        if chunk_id:
+            header += f" · ID {chunk_id}"
+
+        header += "】"
+
+        part = f"{header}\n{content}"
+
+        # Respect overall context limit.
+        remaining = MAX_CONTEXT_CHARS - total_chars
+
+        if remaining <= 0:
+            break
+
+        if len(part) > remaining:
+            part = part[:remaining].rstrip() + "\n[…context truncated…]"
+
+        parts.append(part)
+        total_chars += len(part)
+
+    if not parts:
+        return (
+            "🔍 The PDF index returned documents, but they contained "
+            "no usable text."
+        )
+
+    # --------------------------------------------------------
+    # Build model-facing retrieval context
+    # --------------------------------------------------------
     context = "\n\n---\n\n".join(parts)
+
     return (
-        f"📄 **Retrieved {len(docs)} chunks from the uploaded PDF** "
-        f"(MMR, top_k={top_k}):\n\n"
+        f"📄 **PDF Retrieval Results**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• Chunks retrieved: {len(parts)}\n"
+        f"• Requested top_k: {top_k}\n"
+        f"• Retrieval: MMR\n"
+        f"• Context size: {total_chars:,} characters\n\n"
         f"{context}\n\n"
-        f"---\n"
-        f"*Use the content above to answer the user's question: \"{question}\"*"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"**Answer the user's question using ONLY the retrieved "
+        f"PDF content above.**\n\n"
+        f"User question: {question}\n\n"
+        f"If the retrieved content does not contain enough information "
+        f"to answer the question, explicitly say that the PDF does "
+        f"not provide enough information rather than inventing an answer."
     )
+
+
 
 
 # ============================================================
@@ -1767,16 +4757,24 @@ CURRENT THREAD ID: {thread_id}
 # Agent Node
 # ============================================================
 
-def agent_node(state: ChatState, config: dict):
+from langchain_core.runnables import RunnableConfig
+
+def agent_node(state: ChatState, config: RunnableConfig):
     """
-    Main agent node. Injects the current thread_id into the system prompt so
-    the LLM can pass it through to query_pdf.
+    Main agent node. Reads thread_id from LangGraph's RunnableConfig so the
+    LLM can pass it through to query_pdf.
     """
+    # 1. Extract thread_id directly from the injected config parameter
     thread_id = config.get("configurable", {}).get("thread_id", "unknown")
+
+    # 2. Format the system prompt with the current thread_id
     system_prompt = SYSTEM_PROMPT.format(thread_id=thread_id)
     messages = state["messages"]
     full_messages = [SystemMessage(content=system_prompt)] + list(messages)
-    response = llm.invoke(full_messages)
+    
+    # 3. Invoke the LLM (passing config here is also good practice for tracing)
+    response = llm.invoke(full_messages, config=config)
+    
     return {"messages": [response]}
 
 
