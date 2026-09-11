@@ -1,0 +1,13 @@
+streamlit>=1.40.0
+langchain-core
+langchain-community
+langchain-openai
+langgraph
+openai
+faiss-cpu
+pypdf
+requests
+python-docx
+pandas
+Pillow
+sqlite
