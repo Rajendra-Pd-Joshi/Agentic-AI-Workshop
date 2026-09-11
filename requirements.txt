@@ -10,3 +10,4 @@ requests
 python-docx
 pandas
 Pillow
+langgraph-checkpoint-sqlite
